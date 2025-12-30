@@ -1,0 +1,23 @@
+app:
+  tolerance_weight_kg: 0.01
+  tolerance_tariff_ars: 1.0
+
+rounding:
+  enabled: true
+  decimals: 0
+  mode: round
+
+sgd:
+  fixed_ars: 5378.0
+  threshold_declared_ars: 500000.0
+  excess_rate: 0.01
+  when_missing_declared: fixed_only
+
+tax:
+  iva_rate: 0.21
+
+zones:
+  origin_province: "Salta"
+  tierra_del_fuego_province: "Tierra del Fuego"
+  patagonia_provinces: ["Neuquen","Río Negro","Chubut","Santa Cruz","Tierra del Fuego"]
+  capital_keywords_by_province: {}

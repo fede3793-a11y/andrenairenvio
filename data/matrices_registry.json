@@ -1,0 +1,222 @@
+[
+  {
+    "name": "andreani_2025-12-26_RAW",
+    "marketplace": "andreani",
+    "kind": "RAW",
+    "valid_from": "2025-12-01",
+    "valid_to": null,
+    "created_at": "2025-12-26T11:49:33",
+    "updated_at": "2025-12-26T14:06:03",
+    "path": "data\\andreani_2025-12-26_RAW.pkl",
+    "status": "PUBLISHED",
+    "actor": "Fede",
+    "meta": {
+      "notes": "Corregida (pertenecía a diciembre 26)",
+      "validation": {
+        "errors": [],
+        "warnings": [],
+        "stats": {
+          "rows": 1419
+        }
+      },
+      "matrix_type": "andreani_region",
+      "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
+      "regions": [
+        "INTERIOR I",
+        "INTERIOR II",
+        "LOCAL",
+        "PATAGONIA I",
+        "PATAGONIA II",
+        "TIERRA DEL FUEGO"
+      ],
+      "band_cols": [
+        "0-50",
+        "51-75",
+        "76-100",
+        "101-150",
+        "151-200",
+        "201-250",
+        "251-275",
+        "276-300",
+        "301-325",
+        "326-350"
+      ]
+    }
+  },
+  {
+    "name": "andreani_2025-12-26_NORM",
+    "marketplace": "andreani",
+    "kind": "NORMALIZADA",
+    "valid_from": "2025-08-01",
+    "valid_to": "2025-11-30",
+    "created_at": "2025-12-26T11:50:17",
+    "updated_at": "2025-12-26T11:50:17",
+    "path": "data\\andreani_2025-12-26_NORM.pkl",
+    "status": "PUBLISHED",
+    "actor": "Fede",
+    "meta": {
+      "notes": "",
+      "validation": {
+        "errors": [],
+        "warnings": [],
+        "stats": {
+          "rows": 60
+        }
+      },
+      "matrix_type": "andreani_region",
+      "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
+      "regions": [
+        "INTERIOR I",
+        "INTERIOR II",
+        "LOCAL",
+        "PATAGONIA I",
+        "PATAGONIA II",
+        "TIERRA DEL FUEGO"
+      ],
+      "band_cols": [
+        "0-50",
+        "51-75",
+        "76-100",
+        "101-150",
+        "151-200",
+        "201-250",
+        "251-275",
+        "276-300",
+        "301-325",
+        "326-350"
+      ]
+    }
+  },
+  {
+    "name": "andreani_2025-12-26_RAW",
+    "marketplace": "andreani",
+    "kind": "RAW",
+    "valid_from": "2025-08-01",
+    "valid_to": null,
+    "created_at": "2025-12-26T11:53:54",
+    "updated_at": "2025-12-26T11:53:54",
+    "path": "data\\andreani_2025-12-26_RAW.pkl",
+    "status": "PUBLISHED",
+    "actor": "Fede",
+    "meta": {
+      "notes": "",
+      "validation": {
+        "errors": [],
+        "warnings": [],
+        "stats": {
+          "rows": 1419
+        }
+      },
+      "matrix_type": "andreani_region",
+      "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
+      "regions": [
+        "INTERIOR I",
+        "INTERIOR II",
+        "LOCAL",
+        "PATAGONIA I",
+        "PATAGONIA II",
+        "TIERRA DEL FUEGO"
+      ],
+      "band_cols": [
+        "0-50",
+        "51-75",
+        "76-100",
+        "101-150",
+        "151-200",
+        "201-250",
+        "251-275",
+        "276-300",
+        "301-325",
+        "326-350"
+      ]
+    }
+  },
+  {
+    "name": "andreani_2025-12-26_NORM",
+    "marketplace": "andreani",
+    "kind": "NORMALIZADA",
+    "valid_from": "2025-12-01",
+    "valid_to": null,
+    "created_at": "2025-12-26T11:54:36",
+    "updated_at": "2025-12-26T11:54:36",
+    "path": "data\\andreani_2025-12-26_NORM.pkl",
+    "status": "PUBLISHED",
+    "actor": "Fede",
+    "meta": {
+      "notes": "",
+      "validation": {
+        "errors": [],
+        "warnings": [],
+        "stats": {
+          "rows": 60
+        }
+      },
+      "matrix_type": "andreani_region",
+      "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
+      "regions": [
+        "INTERIOR I",
+        "INTERIOR II",
+        "LOCAL",
+        "PATAGONIA I",
+        "PATAGONIA II",
+        "TIERRA DEL FUEGO"
+      ],
+      "band_cols": [
+        "0-50",
+        "51-75",
+        "76-100",
+        "101-150",
+        "151-200",
+        "201-250",
+        "251-275",
+        "276-300",
+        "301-325",
+        "326-350"
+      ]
+    }
+  },
+  {
+    "name": "Andreani mayo 25",
+    "marketplace": "andreani",
+    "kind": "RAW",
+    "valid_from": "2025-05-01",
+    "valid_to": "2025-07-31",
+    "created_at": "2025-12-26T15:17:13",
+    "updated_at": "2025-12-26T15:17:13",
+    "path": "data\\Andreani_mayo_25.pkl",
+    "status": "PUBLISHED",
+    "actor": "Fede",
+    "meta": {
+      "notes": "",
+      "validation": {
+        "errors": [],
+        "warnings": [],
+        "stats": {
+          "rows": 1420
+        }
+      },
+      "matrix_type": "andreani_region",
+      "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
+      "regions": [
+        "INTERIOR I",
+        "INTERIOR II",
+        "LOCAL",
+        "PATAGONIA I",
+        "PATAGONIA II",
+        "TIERRA DEL FUEGO"
+      ],
+      "band_cols": [
+        "0-50",
+        "51-75",
+        "76-100",
+        "101-150",
+        "151-200",
+        "201-250",
+        "251-275",
+        "276-300",
+        "301-325",
+        "326-350"
+      ]
+    }
+  }
+]
