@@ -1,14 +1,14 @@
 [
   {
-    "name": "andreani_2025-12-26_RAW",
+    "name": "Andreani Diciembre 2025 (sin publicar)",
     "marketplace": "andreani",
     "kind": "RAW",
     "valid_from": "2025-12-01",
     "valid_to": null,
     "created_at": "2025-12-26T11:49:33",
-    "updated_at": "2025-12-26T14:06:03",
-    "path": "data\\andreani_2025-12-26_RAW.pkl",
-    "status": "PUBLISHED",
+    "updated_at": "2025-12-31T10:35:20",
+    "path": "data\\Andreani_Diciembre_2025__sin_publicar_.pkl",
+    "status": "DRAFT",
     "actor": "Fede",
     "meta": {
       "notes": "Corregida (pertenecía a diciembre 26)",
@@ -88,13 +88,13 @@
     }
   },
   {
-    "name": "andreani_2025-12-26_RAW",
+    "name": "Andreani Agosto 2025",
     "marketplace": "andreani",
     "kind": "RAW",
     "valid_from": "2025-08-01",
     "valid_to": null,
     "created_at": "2025-12-26T11:53:54",
-    "updated_at": "2025-12-26T11:53:54",
+    "updated_at": "2025-12-31T10:35:05",
     "path": "data\\andreani_2025-12-26_RAW.pkl",
     "status": "PUBLISHED",
     "actor": "Fede",
@@ -176,14 +176,14 @@
     }
   },
   {
-    "name": "Andreani mayo 25",
+    "name": "Andreani Mayo 2025",
     "marketplace": "andreani",
     "kind": "RAW",
     "valid_from": "2025-05-01",
     "valid_to": "2025-07-31",
     "created_at": "2025-12-26T15:17:13",
-    "updated_at": "2025-12-26T15:17:13",
-    "path": "data\\Andreani_mayo_25.pkl",
+    "updated_at": "2025-12-31T10:33:47",
+    "path": "data\\Andreani_Mayo_2025.pkl",
     "status": "PUBLISHED",
     "actor": "Fede",
     "meta": {

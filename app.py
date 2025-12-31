@@ -27,15 +27,8 @@ from __future__ import annotations
 # Reglas de región Andreani
 # =========================
 # Patagonia vs Interior (según tu criterio operativo)
-PATAGONIA_PROVS_FALLBACK = {
-    "LA PAMPA",
-    "NEUQUEN",
-    "RIO NEGRO",
-    "CHUBUT",
-    "SANTA CRUZ",
-    "TIERRA DEL FUEGO",
-    "TIERRA DEL FUEGO, ANTARTIDA E ISLAS DEL ATLANTICO SUR",
-}
+PATAGONIA_PROVS_FALLBACK = {'NEUQUEN','RIO NEGRO','CHUBUT','SANTA CRUZ'}
+TDF_PROVS_FALLBACK = {'TIERRA DEL FUEGO','TIERRA DEL FUEGO, ANTARTIDA E ISLAS DEL ATLANTICO SUR','TIERRA DEL FUEGO ANTARTIDA E ISLAS DEL ATLANTICO SUR'}
 
 # Capital de provincia => banda I | Interior => banda II.
 # Match por "contiene" contra Localidad (CP master). Ajustable si Andreani redefine.
@@ -577,22 +570,121 @@ def normalize_sales(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
 
 
-def normalize_cp_master(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    warnings=[]
+def normalize_cp_master(df: pd.DataFrame):
+    """Normaliza CP Master.
+
+    Requeridos: CP, Provincia, Localidad.
+    Opcional: Region/Región (si no viene, se calcula con una regla por Provincia/Localidad).
+    Agrega: CP_int (numérico) y region (INTERIOR I/II o PATAGONIA I/II).
+    """
     df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
+
     required = {"CP", "Provincia", "Localidad"}
-    missing = sorted(list(required - set(df.columns)))
-    if missing:
-        raise ValueError(f"Faltan columnas: {missing}. Requeridas: {sorted(required)}")
+    if not required.issubset(set(df.columns)):
+        raise ValueError(f"CP Master debe tener columnas: {sorted(required)}")
+
+    # Detectar columna de región (opcional)
+    reg_col = None
+    for c in df.columns:
+        if norm_text(c) == "REGION":
+            reg_col = c
+            break
+
+    if reg_col is not None:
+        df["region"] = df[reg_col].apply(lambda x: None if (x is None or (isinstance(x, float) and math.isnan(x))) else str(x).strip())
+        # Normalizar strings vacíos
+        df.loc[df["region"].astype(str).str.lower().isin({"nan", "none", ""}), "region"] = None
+    else:
+        df["region"] = None
+
+    # CP_int
     df["CP_int"] = df["CP"].apply(parse_cp_to_int)
-    df = df.dropna(subset=["CP_int"]).copy()
-    df["CP_int"] = df["CP_int"].astype(int)
-    if df["Provincia"].isna().any() or df["Localidad"].isna().any():
-        raise ValueError("Hay filas con Provincia/Localidad vacías.")
+    if df["CP_int"].isna().any():
+        bad = df[df["CP_int"].isna()][["CP"]].head(20).to_dict(orient="records")
+        raise ValueError(f"Hay CP inválidos en CP Master (primeros 20): {bad}")
+
+    # Helpers
+    _allowed = {'PATAGONIA I','PATAGONIA II','INTERIOR I','INTERIOR II','LOCAL','TIERRA DEL FUEGO','TIERRA DEL FUEGO I','TIERRA DEL FUEGO II'}
+    _region_map = {
+        "INTERIORI": "INTERIOR I",
+        "INTERIOR 1": "INTERIOR I",
+        "INTERIORII": "INTERIOR II",
+        "INTERIOR 2": "INTERIOR II",
+        "PATAGONIAI": "PATAGONIA I",
+        "PATAGONIA 1": "PATAGONIA I",
+        "PATAGONIAII": "PATAGONIA II",
+        "PATAGONIA 2": "PATAGONIA II",
+    }
+
+    def _norm_region(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none"}:
+            return None
+        s = norm_text(s).replace("  ", " ").strip()
+        s = _region_map.get(s, s)
+        return s
+
+    def _derive_region(provincia: Any, localidad: Any) -> str:
+        prov_norm = norm_text(provincia)
+        loc_norm = norm_text(localidad)
+
+        is_pat = prov_norm in PATAGONIA_PROVS_FALLBACK
+        prefix = "PATAGONIA" if is_pat else "INTERIOR"
+
+        if prov_norm in TDF_PROVS_FALLBACK:
+            return "TIERRA DEL FUEGO"
+
+        if prov_norm in {"CAPITAL FEDERAL", "CABA", "CIUDAD AUTONOMA DE BUENOS AIRES"} or loc_norm.startswith("CABA"):
+            return f"{prefix} I"
+
+        # Heurística por "capital" de provincia (tokens típicos)
+        cap_dict = {
+            "BUENOS AIRES": ["LA PLATA"],
+            "CATAMARCA": ["SAN FERNANDO", "CATAMARCA"],
+            "CHACO": ["RESISTENCIA"],
+            "CHUBUT": ["RAWSON"],
+            "CORDOBA": ["CORDOBA"],
+            "CORRIENTES": ["CORRIENTES"],
+            "ENTRE RIOS": ["PARANA"],
+            "FORMOSA": ["FORMOSA"],
+            "JUJUY": ["SAN SALVADOR"],
+            "LA PAMPA": ["SANTA ROSA"],
+            "LA RIOJA": ["LA RIOJA"],
+            "MENDOZA": ["MENDOZA"],
+            "MISIONES": ["POSADAS"],
+            "NEUQUEN": ["NEUQUEN"],
+            "RIO NEGRO": ["VIEDMA"],
+            "SALTA": ["SALTA"],
+            "SAN JUAN": ["SAN JUAN"],
+            "SAN LUIS": ["SAN LUIS"],
+            "SANTA CRUZ": ["RIO GALLEGOS"],
+            "SANTA FE": ["SANTA FE"],
+            "SANTIAGO DEL ESTERO": ["SANTIAGO DEL ESTERO"],
+            "TIERRA DEL FUEGO": ["USHUAIA", "RIO GRANDE"],
+            "TUCUMAN": ["SAN MIGUEL", "TUCUMAN"],
+        }
+        tokens = cap_dict.get(prov_norm, [])
+        if any(t in loc_norm for t in tokens):
+            return f"{prefix} I"
+        return f"{prefix} II"
+
+    df["region"] = df["region"].apply(_norm_region)
+    missing = df["region"].isna()
+    if missing.any():
+        df.loc[missing, "region"] = df.loc[missing].apply(lambda r: _derive_region(r["Provincia"], r["Localidad"]), axis=1)
+
+    bad_vals = sorted(set(df["region"].dropna()) - _allowed)
+    if bad_vals:
+        raise ValueError(f"Valores de región inválidos en CP Master: {bad_vals}. Permitidos: {sorted(_allowed)}")
+
     if df["CP_int"].duplicated().any():
-        warnings.append("Hay CP repetidos en CP Master (se toma el primero).")
-    return df.reset_index(drop=True), warnings
+        dups = df[df["CP_int"].duplicated(keep=False)].sort_values("CP_int")[["CP", "Provincia", "Localidad", "CP_int"]].head(30)
+        raise ValueError(f"Hay CP repetidos en CP Master (primeros):\n{dups.to_string(index=False)}")
+
+    df = df[["CP", "Provincia", "Localidad", "region", "CP_int"]].copy()
+    return df
 
 def sales_sanity(df: pd.DataFrame) -> Dict[str, Any]:
     return {
@@ -606,7 +698,7 @@ def sales_sanity(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 # -----------------------------
-# Matrices (versionado básico, sin cambios grandes respecto v1.35)
+# Matrices (versionado básico, sin cambios grandes respecto v1.45)
 # -----------------------------
 def parse_weight_band(col: str) -> Optional[Tuple[float,float]]:
     m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", str(col))
@@ -922,67 +1014,96 @@ def normalize_cp_master_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["CP_int"].notna()].copy()
     return df
 
-def region_from_cp(cp: str, cp_master: pd.DataFrame):
+def region_from_cp(cp: str, cp_master: pd.DataFrame, config: dict | None = None):
     """
     Devuelve (region, provincia, localidad) para un CP.
-    Regla operativa:
-      - Patagonia vs Interior: por provincia (PATAGONIA_PROVS_FALLBACK)
-      - Banda I (capital provincial) vs Banda II (interior): por Localidad vs tokens de capital.
+
+    Prioridad:
+      1) Si CP Master trae columna Region, se usa (normalizada).
+      2) Si falta Region, se infiere con reglas de zona (Patagonia/Interior I/II) + TDF + LOCAL configurable.
     """
-    if cp_master is None or len(cp_master) == 0:
-        return (None, None, None)
+    if cp_master is None or cp_master.empty or cp is None:
+        return ("SIN REGIÓN (CP no mapea)", None, None)
 
-    try:
-        cp_int = cp_to_int(cp)
-    except Exception:
-        return (None, None, None)
+    # columnas (tolerante a mayúsculas/minúsculas)
+    cols = {str(c).strip().lower(): c for c in cp_master.columns}
+    col_cp_int = cols.get("cp_int")
+    col_cp = cols.get("cp")
+    col_prov = cols.get("provincia")
+    col_loc = cols.get("localidad")
+    col_reg = cols.get("region")  # <- clave correcta (antes estaba 'REGION')
 
-    # cp_master puede venir con columnas en mayúscula/minúscula
-    cols = {c.lower(): c for c in cp_master.columns}
-    cp_col = cols.get("cp_int") or cols.get("cp") or cols.get("codigo_postal")
-    prov_col = cols.get("provincia") or cols.get("prov")
-    loc_col = cols.get("localidad") or cols.get("loc") or cols.get("ciudad")
+    cp_int = cp_to_int(cp)
+    if cp_int is None:
+        return ("SIN REGIÓN (CP no mapea)", None, None)
 
-    if cp_col is None or prov_col is None or loc_col is None:
-        return (None, None, None)
-
-    row = cp_master.loc[cp_master[cp_col] == cp_int]
-    if row.empty:
-        # fallback: si CP exacto no existe, no inventamos
-        return (None, None, None)
-
-    provincia = str(row.iloc[0][prov_col])
-    localidad = str(row.iloc[0][loc_col])
-
-    prov_norm = norm_text(provincia)
-    loc_norm = norm_text(localidad)
-
-    pat_set = globals().get("PATAGONIA_PROVS", None)
-    if not pat_set:
-        pat_set = PATAGONIA_PROVS_FALLBACK
-
-    cap_dict = globals().get("CAPITAL_TOKENS_BY_PROV", None)
-    if not cap_dict:
-        cap_dict = CAPITAL_TOKENS_BY_PROV_FALLBACK
-
-    is_capital = False
-    if prov_norm == "CAPITAL FEDERAL":
-        is_capital = True
+    base = cp_master
+    if col_cp_int in base.columns:
+        hit = base[base[col_cp_int] == cp_int]
+    elif col_cp in base.columns:
+        hit = base[base[col_cp].astype(str).str.replace(r"\D", "", regex=True).astype("Int64") == cp_int]
     else:
-        tokens = cap_dict.get(prov_norm, [])
-        # match por contiene (token ya está en mayúsculas; loc_norm también)
-        for t in tokens:
-            if norm_text(t) in loc_norm:
-                is_capital = True
-                break
+        hit = base.iloc[0:0]
 
-    prefix = "PATAGONIA" if prov_norm in pat_set else "INTERIOR"
+    if hit.empty:
+        return ("SIN REGIÓN (CP no mapea)", None, None)
+
+    row = hit.iloc[0]
+    provincia = row[col_prov] if col_prov in base.columns else None
+    localidad = row[col_loc] if col_loc in base.columns else None
+
+    def _norm_region(val: str) -> str:
+        r = norm_text(val).upper()
+        r = re.sub(r"\s+", " ", r).strip()
+        # Aceptamos variantes con I/II y las consolidamos
+        if r.startswith("TIERRA DEL FUEGO"):
+            return "TIERRA DEL FUEGO"
+        return r
+
+    # 1) si viene region en CP Master, usarla
+    if col_reg in base.columns:
+        raw_reg = row[col_reg]
+        if pd.notna(raw_reg) and str(raw_reg).strip():
+            return (_norm_region(str(raw_reg)), provincia, localidad)
+
+    # 2) inferencia (con config)
+    zones = (config or {}).get("zones", {}) if isinstance(config, dict) else {}
+
+    # LOCAL configurable por CP o localidad (opcional)
+    local_cps = set(str(x).strip() for x in zones.get("local_cps", []) if str(x).strip())
+    local_locs = set(norm_text(str(x)) for x in zones.get("local_localidades", []) if str(x).strip())
+
+    cp_digits = str(cp_int)
+    loc_norm = norm_text(localidad) if pd.notna(localidad) else ""
+    if (cp_digits in local_cps) or (loc_norm in local_locs):
+        return ("LOCAL", provincia, localidad)
+
+    prov_norm = norm_text(provincia) if pd.notna(provincia) else ""
+
+    # TIERRA DEL FUEGO como región propia (no Patagonia)
+    tdf_name = zones.get("tierra_del_fuego_province", "Tierra del Fuego")
+    if prov_norm and prov_norm == norm_text(tdf_name):
+        return ("TIERRA DEL FUEGO", provincia, localidad)
+
+    # Patagonia (sin Tierra del Fuego)
+    pat_list = zones.get("patagonia_provinces", [])
+    pat_set = set(norm_text(p) for p in pat_list if str(p).strip())
+    prefix = "PATAGONIA" if (prov_norm and prov_norm in pat_set) else "INTERIOR"
+
+    # Capital vs interior: si no podemos determinar, asumimos II (conservador)
+    cap_map = globals().get("CAPITAL_BY_PROV", {}) or {}
+    cap = cap_map.get(prov_norm) if prov_norm else None
+
+    capital_tokens = ["CABA", "CAPITAL", "CAP. FEDERAL", "CAP FEDERAL", "CAP."]  # heurística
+    is_capital = False
+    if loc_norm:
+        if cap and loc_norm == cap:
+            is_capital = True
+        if any(tok in loc_norm.upper() for tok in capital_tokens):
+            is_capital = True
+
     band = "I" if is_capital else "II"
-    region = f"{prefix} {band}"
-
-    return (region, provincia, localidad)
-
-
+    return (f"{prefix} {band}", provincia, localidad)
 
 def expected_disd_from_raw(raw_matrix: pd.DataFrame, region: str, weight_kg: float) -> Optional[float]:
     """
@@ -1397,8 +1518,8 @@ def change_plan(old: Optional[pd.DataFrame], new: pd.DataFrame, key_cols: List[s
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Andreani | Gestión logística (v1.42)", layout="wide")
-st.title("Andreani | Gestión logística (v1.42) — Modo simulación")
+st.set_page_config(page_title="Andreani | Gestión logística (v1.45)", layout="wide")
+st.title("Andreani | Gestión logística (v1.45) — Modo simulación")
 
 with st.sidebar:
     st.header("Operación")
@@ -1433,11 +1554,6 @@ reg_all = list_matrices(None)
 # HOME
 if page == "Home":
     st.subheader("Estado / Memoria")
-    st.caption("Versión en ejecución: v1.35")
-    with st.expander("Diagnóstico (para evitar confusiones de versión)", expanded=False):
-        st.code(__file__)
-        st.write("Si arriba dice v1.35, estás ejecutando otro app.py.")
-        st.write("Recomendado en Windows: streamlit run app.py --server.fileWatcherType none")
     st.info("Regla dura: la app SOLO usa matrices con estado PUBLISHED para cálculos. DRAFT es borrador.")
     st.dataframe(memory_status(), use_container_width=True, height=280)
 
@@ -1464,6 +1580,55 @@ if page == "CP Master":
 
     st.caption("Tip: si tu archivo trae CP con separadores (ej. 1,071), la app lo normaliza a 1071 para el matching.")
     dataset_panel("CP Master", cp_master, "cp_master", CP_MASTER_PATH)
+
+    st.markdown("### Edición manual de CP Master (pro)")
+    st.caption("Acá podés ajustar/crear filas y asignar **region** con selector (evita regiones inválidas).")
+
+    REGION_OPTIONS = ["LOCAL", "INTERIOR I", "INTERIOR II", "PATAGONIA I", "PATAGONIA II", "TIERRA DEL FUEGO"]
+
+    if cp_master is None or getattr(cp_master, "empty", True):
+        st.info("No hay CP Master cargado para editar.")
+    else:
+        editor_src = cp_master.copy()
+
+        # Si el archivo no trae región, la calculamos como base (igual podés editarla).
+        if "region" not in editor_src.columns:
+            try:
+                editor_src["region"] = editor_src.apply(lambda r: region_from_cp(r.get("CP", r.get("CP_int")), cp_master)[0], axis=1)
+            except Exception:
+                editor_src["region"] = None
+
+        # Solo lo que se edita a mano
+        cols_edit = [c for c in ["CP", "Provincia", "Localidad", "region"] if c in editor_src.columns]
+        editor_view = editor_src[cols_edit].copy()
+
+        edited_cp = st.data_editor(
+            editor_view,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "region": st.column_config.SelectboxColumn("region", options=REGION_OPTIONS, required=True),
+            },
+        )
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Guardar edición de CP Master", type="primary"):
+                try:
+                    norm = normalize_cp_master(edited_cp)
+                    set_cp_master(norm)
+                    st.success("CP Master actualizado.")
+                except Exception as e:
+                    st.error(f"No pude guardar el CP Master: {e}")
+
+        with c2:
+            tpl = pd.DataFrame(columns=["CP", "Provincia", "Localidad", "region"])
+            st.download_button(
+                "Descargar plantilla CP Master (con región)",
+                data=tpl.to_csv(index=False).encode("utf-8"),
+                file_name="template_cp_master_region.csv",
+                mime="text/csv",
+            )
 
     st.divider()
     st.markdown("### Import (preview + validación)")
@@ -1794,7 +1959,7 @@ if page == "Matriz Andreani (madre)":
         st.divider()
         st.markdown("#### Duplicar como nueva versión (recomendado para correcciones)")
         with st.form("dup_form"):
-            new_name = st.text_input("Nombre nueva versión", value=f"{action_name}_v1.35")
+            new_name = st.text_input("Nombre nueva versión", value=f"{action_name}_{today().isoformat()}")
             nvf = st.date_input("Nueva vigencia desde", value=pd.to_datetime(row2.get("valid_from"), errors="coerce").date())
             nhas_end = st.checkbox("Nueva vigencia con fin", value=row2.get("valid_to") is not None)
             nvt = st.date_input("Nueva vigencia hasta", value=pd.to_datetime(row2.get("valid_to") or dt.date.today(), errors="coerce").date()) if nhas_end else None
@@ -1958,7 +2123,7 @@ if page == "Auditor Facturas":
 
     # Map CP -> region/prov/loc
     agg[["region","provincia","localidad"]] = agg.apply(
-        lambda r: pd.Series(region_from_cp(r["cp"], cp_master)),
+        lambda r: pd.Series(region_from_cp(r["cp"], cp_master, config)),
         axis=1
     )
 
@@ -2266,7 +2431,7 @@ if page == "Auditor Facturas":
     r2c1.metric("Saltos de tramo", salto_tramo_cnt)
     r2c2.metric("Sobreprecio (casos)", sobreprecio_cnt)
     r2c3.metric("Sin venta", sin_venta_cnt)
-        r2c4.metric("Tolerancias", f"${tol_ars} / {tol_kg}kg")
+    r2c4.metric("Tolerancias", f"${tol_ars} / {tol_kg}kg")
 
     with st.expander("Glosario (qué significa delta_*)", expanded=False):
         st.markdown("""
