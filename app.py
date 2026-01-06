@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Andreani | App (v1.41)
+Andreani | App (v1.53)
 --------------------
 ✅ v1.41: UI de auditoría más legible (deltas + tramos + filtros), menos ruido en pantalla
 
@@ -61,6 +61,8 @@ CAPITAL_TOKENS_BY_PROV_FALLBACK = {
 }
 
 import io, os, json, math, re, shutil, unicodedata
+import warnings
+warnings.filterwarnings("ignore", message="Data Validation extension is not supported.*")
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
@@ -412,7 +414,7 @@ def load_config(uploaded: Optional[io.BytesIO]) -> Dict[str, Any]:
 def audit_log(action: str, actor: str, payload: Dict[str, Any]) -> None:
     rec = {"ts": iso_now(), "action": action, "actor": actor, "payload": payload}
     with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 def read_audit_tail(n: int = 300) -> pd.DataFrame:
     if not os.path.exists(AUDIT_LOG_PATH):
@@ -579,14 +581,33 @@ def normalize_cp_master(df: pd.DataFrame):
     """
     df = df.copy()
 
+    # --- Normalización de encabezados (para que no falle por mayúsculas/minúsculas) ---
+    # Acepta: CP/cp, Provincia/provincia, Localidad/localidad, Region/region/región, etc.
+    rename: Dict[str, str] = {}
+    for c in list(df.columns):
+        nc = norm_text(str(c))
+        # norm_text devuelve minúsculas sin acentos y con espacios normalizados
+        if nc in {"cp", "codigo postal", "codigopostal", "cod postal", "codpostal", "cpostal", "zip", "postal"}:
+            rename[c] = "CP"
+        elif nc in {"provincia", "prov", "state", "estado"}:
+            rename[c] = "Provincia"
+        elif nc in {"localidad", "ciudad", "local"}:
+            rename[c] = "Localidad"
+        elif nc in {"region", "reg", "zona"}:
+            rename[c] = "Region"
+    if rename:
+        df = df.rename(columns=rename)
+
+
     required = {"CP", "Provincia", "Localidad"}
     if not required.issubset(set(df.columns)):
-        raise ValueError(f"CP Master debe tener columnas: {sorted(required)}")
+        found = sorted([str(c) for c in df.columns])
+        raise ValueError(f"CP Master debe tener columnas: {sorted(required)}. Encontradas: {found}")
 
     # Detectar columna de región (opcional)
     reg_col = None
     for c in df.columns:
-        if norm_text(c) == "REGION":
+        if norm_text(c) == "region":
             reg_col = c
             break
 
@@ -698,7 +719,7 @@ def sales_sanity(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 # -----------------------------
-# Matrices (versionado básico, sin cambios grandes respecto v1.45)
+# Matrices (versionado básico, sin cambios grandes respecto v1.50)
 # -----------------------------
 def parse_weight_band(col: str) -> Optional[Tuple[float,float]]:
     m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", str(col))
@@ -1220,12 +1241,12 @@ def update_matrix_entry(name: str, actor: str, updates: Dict[str, Any]) -> None:
     idx = _find_registry_index(reg, name)
     if idx is None:
         raise ValueError(f"No existe la versión: {name}")
-    before = json.loads(json.dumps(reg[idx], ensure_ascii=False))
+    before = json.loads(json.dumps(reg[idx], ensure_ascii=False, default=str))
     for k, v in updates.items():
         reg[idx][k] = v
     reg[idx]["updated_at"] = iso_now()
     save_registry(reg)
-    after = json.loads(json.dumps(reg[idx], ensure_ascii=False))
+    after = json.loads(json.dumps(reg[idx], ensure_ascii=False, default=str))
     audit_log("matrix_update", actor, {"name": name, "before": before, "after": after})
     load_matrix_from_disk.clear()
 
@@ -1518,8 +1539,8 @@ def change_plan(old: Optional[pd.DataFrame], new: pd.DataFrame, key_cols: List[s
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Andreani | Gestión logística (v1.45)", layout="wide")
-st.title("Andreani | Gestión logística (v1.45) — Modo simulación")
+st.set_page_config(page_title="Andreani | Gestión logística (v1.53)", layout="wide")
+st.title("Andreani | Gestión logística (v1.53) — Modo simulación")
 
 with st.sidebar:
     st.header("Operación")
@@ -1938,43 +1959,94 @@ if page == "Matriz Andreani (madre)":
                 st.warning("Despublicada. (No se usa para cálculos)")
 
         st.divider()
+        
         st.markdown("#### Editar vigencia + notas")
-        with st.form("edit_meta_form"):
-            vf = st.date_input("Vigente desde", value=pd.to_datetime(row2.get("valid_from"), errors="coerce").date())
-            has_end2 = st.checkbox("Tiene fecha de fin", value=row2.get("valid_to") is not None)
-            vt = st.date_input("Vigente hasta", value=pd.to_datetime(row2.get("valid_to") or dt.date.today(), errors="coerce").date()) if has_end2 else None
-            notes_prev = (row2.get("meta") or {}).get("notes","")
-            notes2 = st.text_area("Notas", value=notes_prev)
-            submit = st.form_submit_button("Guardar cambios de metadata")
-            if submit:
-                meta_new = dict(row2.get("meta") or {})
-                meta_new["notes"] = notes2
-                update_matrix_entry(action_name, actor, {
-                    "valid_from": vf.isoformat(),
-                    "valid_to": vt.isoformat() if vt else None,
-                    "meta": meta_new
-                })
-                st.success("Metadata actualizada.")
 
+        # OJO: el checkbox fuera del form permite que aparezca/desaparezca el campo "Vigente hasta"
+        # sin tener que apretar "Guardar" primero (Streamlit forms no re-ejecutan en cada cambio).
+        _ver_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(action_name))
+
+        _vf0 = pd.to_datetime(row2.get("valid_from"), errors="coerce")
+        vf_default = (_vf0.date() if not pd.isna(_vf0) else today())
+
+        has_end2 = st.checkbox(
+            "Tiene fecha de fin",
+            value=row2.get("valid_to") is not None,
+            key=f"meta_has_end_{_ver_key}",
+        )
+
+        with st.form(f"edit_meta_form_{_ver_key}"):
+            vf = st.date_input("Vigente desde", value=vf_default, key=f"meta_vf_{_ver_key}")
+
+            vt = None
+            if has_end2:
+                _vt0 = pd.to_datetime(row2.get("valid_to"), errors="coerce")
+                vt_default = (_vt0.date() if not pd.isna(_vt0) else vf_default)
+                vt = st.date_input("Vigente hasta", value=vt_default, key=f"meta_vt_{_ver_key}")
+
+            notes2 = st.text_area(
+                "Notas",
+                value=str(row2.get("notes") or ""),
+                placeholder="Ej: ajuste por actualización tarifaria / referencia / uplift / etc.",
+                height=120,
+                key=f"meta_notes_{_ver_key}",
+            )
+            submit_meta = st.form_submit_button("Guardar cambios de metadata")
+
+        if submit_meta:
+            update_matrix_entry(
+                action_name,
+                actor,
+                {
+                    "valid_from": vf,
+                    "valid_to": vt,
+                    "notes": notes2,
+                },
+            )
+            st.success("Metadata actualizada.")
+
+        
         st.divider()
         st.markdown("#### Duplicar como nueva versión (recomendado para correcciones)")
-        with st.form("dup_form"):
-            new_name = st.text_input("Nombre nueva versión", value=f"{action_name}_{today().isoformat()}")
-            nvf = st.date_input("Nueva vigencia desde", value=pd.to_datetime(row2.get("valid_from"), errors="coerce").date())
-            nhas_end = st.checkbox("Nueva vigencia con fin", value=row2.get("valid_to") is not None)
-            nvt = st.date_input("Nueva vigencia hasta", value=pd.to_datetime(row2.get("valid_to") or dt.date.today(), errors="coerce").date()) if nhas_end else None
-            nnotes = st.text_area("Notas nuevas (opcional)", value=f"Duplicada desde {action_name}.")
-            keep_published = st.checkbox("Publicar automáticamente", value=False)
-            dup_submit = st.form_submit_button("Crear duplicado")
-            if dup_submit:
-                tweaks = {
-                    "valid_from": nvf.isoformat(),
-                    "valid_to": nvt.isoformat() if nvt else None,
-                    "status": "PUBLISHED" if keep_published else "DRAFT",
-                    "meta": {"notes": nnotes},
-                }
-                duplicate_matrix_version(action_name, new_name.strip(), actor, tweaks)
-                st.success("Duplicado creado.")
+
+        # Checkbox fuera del form para que el "Vigente hasta" aparezca en vivo
+        _ver_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(action_name))
+        nhas_end = st.checkbox("Nueva vigencia con fin", value=False, key=f"dup_has_end_{_ver_key}")
+
+        with st.form(f"dup_form_{_ver_key}"):
+            new_name = st.text_input(
+                "Nombre nueva versión",
+                value=f"{action_name} (copia)",
+                key=f"dup_name_{_ver_key}",
+            )
+            nvf = st.date_input("Vigente desde (nueva)", value=today(), key=f"dup_vf_{_ver_key}")
+            nvt = None
+            if nhas_end:
+                nvt = st.date_input("Vigente hasta (nueva)", value=today(), key=f"dup_vt_{_ver_key}")
+            nnotes = st.text_area(
+                "Notas (nueva versión)",
+                value="",
+                placeholder="Qué cambiaste y por qué (ej: corrección de tarifa / referencia / uplift).",
+                height=100,
+                key=f"dup_notes_{_ver_key}",
+            )
+            do_dup = st.form_submit_button("Crear duplicado (DRAFT)")
+
+        if do_dup:
+            # Duplicamos SOLO el dataset, no pisamos el original
+            df_dup = read_pkl(action_name).copy()
+            new_entry = register_matrix(
+                marketplace="andreani",
+                kind=action_kind,
+                name=new_name,
+                status="DRAFT",
+                valid_from=nvf,
+                valid_to=nvt,
+                actor=actor,
+                notes=nnotes,
+                df=df_dup,
+            )
+            st.success("Duplicado creado.")
 
         st.divider()
         st.markdown("#### Eliminar (solo DRAFT)")
@@ -2432,6 +2504,29 @@ if page == "Auditor Facturas":
     r2c2.metric("Sobreprecio (casos)", sobreprecio_cnt)
     r2c3.metric("Sin venta", sin_venta_cnt)
     r2c4.metric("Tolerancias", f"${tol_ars} / {tol_kg}kg")
+
+
+    # Costo promedio por envío (factura) incluyendo seguro/SGD + IVA
+    # (si no hay YAML, usamos 21% como default)
+    iva_rate = float(((config or {})
+                     .get("tax", {})
+                     .get("iva_rate", 0.21)))
+    # Factura: total_factura ya es DISD + SGD (sin IVA)
+    fact_mask = rep["total_factura"].notna() if "total_factura" in rep.columns else pd.Series([False]*len(rep))
+    fact_avg = float(rep.loc[fact_mask, "total_factura"].mean()) if fact_mask.any() else 0.0
+    fact_avg_iva = fact_avg * (1.0 + iva_rate)
+
+    # Esperado (base): total_esperado ya es DISD esperado + SGD esperado (sin IVA)
+    exp_mask = rep.get("matrix_name", pd.Series([None]*len(rep))).notna() if len(rep) else pd.Series(dtype=bool)
+    exp_avg = float(rep.loc[exp_mask, "total_esperado"].mean()) if (len(rep) and exp_mask.any() and "total_esperado" in rep.columns) else 0.0
+    exp_avg_iva = exp_avg * (1.0 + iva_rate)
+
+    delta_avg_iva = (fact_avg - exp_avg) * (1.0 + iva_rate)
+
+    r3c1, r3c2, r3c3 = st.columns(3)
+    r3c1.metric("Costo promedio factura (con IVA)", f"${fact_avg_iva:,.2f}")
+    r3c2.metric("Costo promedio esperado (con IVA)", f"${exp_avg_iva:,.2f}")
+    r3c3.metric("Delta promedio (con IVA)", f"${delta_avg_iva:,.2f}")
 
     with st.expander("Glosario (qué significa delta_*)", expanded=False):
         st.markdown("""

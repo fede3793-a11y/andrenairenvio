@@ -1,14 +1,14 @@
 [
   {
-    "name": "Andreani Diciembre 2025 (sin publicar)",
+    "name": "Andreani Diciembre 2025",
     "marketplace": "andreani",
     "kind": "RAW",
-    "valid_from": "2025-12-01",
+    "valid_from": "2025-12-14",
     "valid_to": null,
     "created_at": "2025-12-26T11:49:33",
-    "updated_at": "2025-12-31T10:35:20",
-    "path": "data\\Andreani_Diciembre_2025__sin_publicar_.pkl",
-    "status": "DRAFT",
+    "updated_at": "2026-01-06T12:26:39",
+    "path": "data\\Andreani_Diciembre_2025.pkl",
+    "status": "PUBLISHED",
     "actor": "Fede",
     "meta": {
       "notes": "Corregida (pertenecía a diciembre 26)",
@@ -41,7 +41,8 @@
         "301-325",
         "326-350"
       ]
-    }
+    },
+    "notes": "-"
   },
   {
     "name": "andreani_2025-12-26_NORM",
@@ -92,9 +93,9 @@
     "marketplace": "andreani",
     "kind": "RAW",
     "valid_from": "2025-08-01",
-    "valid_to": null,
+    "valid_to": "2025-12-14",
     "created_at": "2025-12-26T11:53:54",
-    "updated_at": "2025-12-31T10:35:05",
+    "updated_at": "2026-01-06T12:18:20",
     "path": "data\\andreani_2025-12-26_RAW.pkl",
     "status": "PUBLISHED",
     "actor": "Fede",
@@ -129,7 +130,8 @@
         "301-325",
         "326-350"
       ]
-    }
+    },
+    "notes": ""
   },
   {
     "name": "andreani_2025-12-26_NORM",
