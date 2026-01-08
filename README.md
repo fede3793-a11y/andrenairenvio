@@ -1,4 +1,4 @@
-# Andreani App v1.34 — Modo simulación + visualización completa
+# Andreani App v1.50 — Modo simulación + visualización completa
 
 ## Modo simulación (lo que pediste)
 - En cada import, por defecto **NO se guarda nada**.
