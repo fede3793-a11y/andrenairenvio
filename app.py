@@ -344,6 +344,10 @@ def to_excel_bytes(df: pd.DataFrame, sheet: str="data") -> bytes:
         df.to_excel(w, index=False, sheet_name=sheet[:31])
     return out.getvalue()
 
+# --- Compat: algunos botones llaman esta función vieja ---
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str="data") -> bytes:
+    return to_excel_bytes(df, sheet=sheet_name)
+
 # -----------------------------
 # Backup + borrar + restore
 # -----------------------------
@@ -628,13 +632,13 @@ def normalize_cp_master(df: pd.DataFrame):
     _allowed = {'PATAGONIA I','PATAGONIA II','INTERIOR I','INTERIOR II','LOCAL','TIERRA DEL FUEGO','TIERRA DEL FUEGO I','TIERRA DEL FUEGO II'}
     _region_map = {
         "INTERIORI": "INTERIOR I",
-        "INTERIOR 1": "INTERIOR I",
+        "INTERIOR1": "INTERIOR I",
         "INTERIORII": "INTERIOR II",
         "INTERIOR 2": "INTERIOR II",
         "PATAGONIAI": "PATAGONIA I",
-        "PATAGONIA 1": "PATAGONIA I",
+        "PATAGONIA1": "PATAGONIA I",
         "PATAGONIAII": "PATAGONIA II",
-        "PATAGONIA 2": "PATAGONIA II",
+        "PATAGONIA2": "PATAGONIA II",
     }
 
     def _norm_region(v: Any) -> Optional[str]:
@@ -643,13 +647,14 @@ def normalize_cp_master(df: pd.DataFrame):
         s = str(v).strip()
         if not s or s.lower() in {"nan", "none"}:
             return None
-        s = norm_text(s).replace("  ", " ").strip()
-        s = _region_map.get(s, s)
+        s = re.sub(r"\s+", " ", norm_text(s).upper()).strip()
+        # map tolerante (sin espacios)
+        s = _region_map.get(s.replace(" ", ""), s)
         return s
 
     def _derive_region(provincia: Any, localidad: Any) -> str:
-        prov_norm = norm_text(provincia)
-        loc_norm = norm_text(localidad)
+        prov_norm = norm_text(provincia).upper()
+        loc_norm = norm_text(localidad).upper()
 
         is_pat = prov_norm in PATAGONIA_PROVS_FALLBACK
         prefix = "PATAGONIA" if is_pat else "INTERIOR"

@@ -16,3 +16,6 @@ __pycache__/
 data/backups/
 *.pkl
 *.log
+
+.venv/
+
