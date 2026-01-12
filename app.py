@@ -1,228 +1,113 @@
 # -*- coding: utf-8 -*-
 """
-Andreani | App (v1.53)
---------------------
-✅ v1.41: UI de auditoría más legible (deltas + tramos + filtros), menos ruido en pantalla
+Andreani | Gestión logística (v1.54)
+-----------------------------------
+Fix PRO (v1.54)
+- Unifica region_key (CP Master + Matriz Andreani + Auditor) para evitar "SIN TARIFA" por mismatch de etiquetas.
+- Lookup de tarifa robusto: soporta excedente por kg (Exc) cuando el peso supera el último tramo.
+- Parser PDF Andreani estable: agrupa SGD/DISD y guía por bloque (funciona con formato "Servicio de transporte ... / Nro. de Envío: ...").
+- Mantiene modo simulación + aplicar (con backup) y persistencia local en ./data.
 
-- Cada import (CP Master / Catálogo / Ventas / Matriz) se trabaja como:
-  1) Subís archivo -> Preview + Validación + Sanity-check
-  2) Se genera un "Plan de cambios" (qué se va a guardar y cómo impacta)
-  3) Podés:
-     - Simular (no guarda)
-     - Aplicar (guarda, con backup)
-     - Exportar el preview normalizado a Excel/CSV
-
-- Visualización:
-  - Se ve el dataset actual completo (paginado) + métricas
-  - Se puede descargar el dataset actual
-  - Se puede descargar el preview normalizado (lo que se va a guardar)
-
-Persistencia local en ./data (igual que antes).
+Requisitos:
+- streamlit, pandas, openpyxl, pyyaml, pdfplumber
 """
 
 from __future__ import annotations
 
-
-# =========================
-# Reglas de región Andreani
-# =========================
-# Patagonia vs Interior (según tu criterio operativo)
-PATAGONIA_PROVS_FALLBACK = {'NEUQUEN','RIO NEGRO','CHUBUT','SANTA CRUZ'}
-TDF_PROVS_FALLBACK = {'TIERRA DEL FUEGO','TIERRA DEL FUEGO, ANTARTIDA E ISLAS DEL ATLANTICO SUR','TIERRA DEL FUEGO ANTARTIDA E ISLAS DEL ATLANTICO SUR'}
-
-# Capital de provincia => banda I | Interior => banda II.
-# Match por "contiene" contra Localidad (CP master). Ajustable si Andreani redefine.
-CAPITAL_TOKENS_BY_PROV_FALLBACK = {
-    "BUENOS AIRES": ["LA PLATA"],
-    "CATAMARCA": ["SAN FERNANDO DEL VALLE DE CATAMARCA"],
-    "CHACO": ["RESISTENCIA"],
-    "CHUBUT": ["RAWSON"],
-    "CORDOBA": ["CORDOBA"],
-    "CORRIENTES": ["CORRIENTES"],
-    "ENTRE RIOS": ["PARANA"],
-    "FORMOSA": ["FORMOSA"],
-    "JUJUY": ["SAN SALVADOR DE JUJUY"],
-    "LA PAMPA": ["SANTA ROSA"],
-    "LA RIOJA": ["LA RIOJA"],
-    "MENDOZA": ["MENDOZA"],
-    "MISIONES": ["POSADAS"],
-    "NEUQUEN": ["NEUQUEN"],
-    "RIO NEGRO": ["VIEDMA"],
-    "SALTA": ["SALTA"],
-    "SAN JUAN": ["SAN JUAN"],
-    "SAN LUIS": ["SAN LUIS"],
-    "SANTA CRUZ": ["RIO GALLEGOS"],
-    "SANTA FE": ["SANTA FE"],
-    "SANTIAGO DEL ESTERO": ["SANTIAGO DEL ESTERO"],
-    "TIERRA DEL FUEGO": ["USHUAIA"],
-    "TUCUMAN": ["SAN MIGUEL DE TUCUMAN"],
-    # CABA (Capital Federal): siempre "capital"
-    "CAPITAL FEDERAL": ["CABA"],
-}
-
-import io, os, json, math, re, shutil, unicodedata
-import warnings
-warnings.filterwarnings("ignore", message="Data Validation extension is not supported.*")
+import io
+import os
+import re
+import json
+import math
+import shutil
+import unicodedata
 import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
-from numbers import Integral
-from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-def safe_show_df(df: pd.DataFrame, *, label: str = "", max_rows: int = 2000, use_container_width: bool = True):
-    """
-    Render defensivo para evitar crashes del front (React error #185) por dtypes mixtos/raros.
-    - Normaliza fechas a string ISO.
-    - Convierte object a string.
-    - Limita filas (descarga CSV para ver todo).
-    """
-    if df is None:
-        st.info("No hay datos para mostrar.")
-        return
-
-    try:
-        view = df.copy()
-
-        # Reset index para evitar indices raros (MultiIndex / duplicados)
-        try:
-            view = view.reset_index(drop=True)
-        except Exception:
-            pass
-
-        # Normalización por tipo
-        for c in list(view.columns):
-            s = view[c]
-            # datetimes
-            if pd.api.types.is_datetime64_any_dtype(s):
-                view[c] = pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m-%d")
-                continue
-            # timedeltas/periods
-            if pd.api.types.is_timedelta64_dtype(s) or pd.api.types.is_period_dtype(s):
-                view[c] = s.astype(str)
-                continue
-            # objects: a string, pero preservando NaN como vacío
-            if pd.api.types.is_object_dtype(s):
-                view[c] = s.fillna("").astype(str)
-                continue
-
-        # Limite para UI
-        truncated = False
-        if len(view) > max_rows:
-            truncated = True
-            view_small = view.head(max_rows).copy()
-        else:
-            view_small = view
-
-        st.dataframe(view_small, use_container_width=use_container_width)
-
-        if truncated:
-            st.warning(f"Mostrando solo las primeras {max_rows} filas para estabilidad. Podés descargar el CSV completo abajo.")
-        # Descarga CSV (siempre)
-        try:
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                f"Descargar CSV ({label or 'tabla'})",
-                data=csv,
-                file_name=f"{(label or 'tabla').replace(' ', '_').lower()}.csv",
-                mime="text/csv",
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-        st.error(f"No pude renderizar la tabla en pantalla ({label}). Error: {e}")
-        # Como fallback, mostrar texto
-        try:
-            st.text(str(df.head(50)))
-        except Exception:
-            pass
-
 import pdfplumber
 import yaml
 
+# =========================
+# Paths / Persistencia
+# =========================
 DATA_DIR = "data"
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-REGISTRY_PATH = os.path.join(DATA_DIR, "matrices_registry.json")
-AUDIT_LOG_PATH = os.path.join(DATA_DIR, "audit_log.jsonl")
+
+CP_MASTER_PATH = os.path.join(DATA_DIR, "cp_master.pkl")
 CATALOG_PATH = os.path.join(DATA_DIR, "catalog.pkl")
 SALES_PATH = os.path.join(DATA_DIR, "sales.pkl")
-CP_MASTER_PATH = os.path.join(DATA_DIR, "cp_master.pkl")
-FREE_SHIP_PATH = os.path.join(DATA_DIR, "free_shipping_cps.json")
+
+MATRIX_DIR = os.path.join(DATA_DIR, "matrices")
+REGISTRY_PATH = os.path.join(DATA_DIR, "matrices_registry.json")
+
+AUDIT_LOG_PATH = os.path.join(DATA_DIR, "audit_log.jsonl")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-TPL_CONFIG = os.path.join(APP_DIR, "config.yaml")
+
 TPL_CP = os.path.join(APP_DIR, "template_cp_master.xlsx")
 TPL_CATALOG = os.path.join(APP_DIR, "template_catalogo.xlsx")
 TPL_SALES = os.path.join(APP_DIR, "template_ventas.xlsx")
-TPL_ME1 = os.path.join(APP_DIR, "template_matriz_me1.xlsx")
-TPL_BNA = os.path.join(APP_DIR, "template_matriz_bna.xlsx")
 TPL_AND = os.path.join(APP_DIR, "template_matriz_andreani.xlsx")
 TPL_FREE = os.path.join(APP_DIR, "template_free_shipping_cps.xlsx")
+TPL_CONFIG = os.path.join(APP_DIR, "config.yaml")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(MATRIX_DIR, exist_ok=True)
 
-# -----------------------------
+
+# =========================
 # Utilidades base
-# -----------------------------
-def today() -> dt.date:
-    return dt.date.today()
-
+# =========================
 def iso_now() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
-def file_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
+
+def today() -> dt.date:
+    return dt.date.today()
 
 
 def norm_text(s: Any) -> str:
-    """Normaliza textos (provincias/localidades) para comparaciones robustas.
-
+    """
+    Normaliza textos para comparaciones robustas:
     - lower + strip
-    - quita tildes/diacríticos
+    - quita tildes
     - reemplaza puntuación por espacios
     - colapsa espacios
     """
     if s is None:
         return ""
     s = str(s).strip().lower()
-    # Remover tildes/diacríticos: "San Martín" -> "san martin"
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # Puntuación fuera (ej: "C.A.B.A." -> "c a b a")
     s = re.sub(r"[^a-z0-9\s]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def cp_to_int(cp: Any) -> Optional[int]:
-    """Convierte CP a entero (tolerante a formatos típicos de Argentina).
-
-    Soporta:
-    - int / numpy.int64 / etc.
-    - float de Excel (8340.0) sin transformarlo en 83400
-    - strings: '1071', '1.071', 'A4400', 'U8340'
-    """
+def parse_cp_to_int(cp: Any) -> Optional[int]:
+    """Convierte CP a entero (tolerante a Excel / strings con separadores / CP con letras)."""
     if cp is None:
         return None
     if isinstance(cp, float) and math.isnan(cp):
         return None
 
-    # Números enteros (incluye numpy/pandas ints vía Integral)
-    if isinstance(cp, Integral):
-        return int(cp)
+    # ints (incluye numpy ints)
+    try:
+        if isinstance(cp, (int,)) and not isinstance(cp, bool):
+            return int(cp)
+    except Exception:
+        pass
 
-    # Floats típicos de Excel
+    # floats típicos de Excel
     if isinstance(cp, float):
         if float(cp).is_integer():
             return int(cp)
 
     s = str(cp).strip().upper()
-
-    # Caso clásico: '8340.0' / '1071.00'
     if re.fullmatch(r"\d+\.0+", s):
         return int(s.split(".")[0])
 
@@ -230,18 +115,15 @@ def cp_to_int(cp: Any) -> Optional[int]:
     if not digits:
         return None
 
-    # Si venía como '8340.0' y por algún motivo no matcheó arriba, evitamos '83400'
+    # Evitar 8340.0 -> 83400 si viniera dividido en grupos
     if "." in s and len(digits) > 1 and all(set(d) == {"0"} for d in digits[1:]):
         return int(digits[0])
 
     return int("".join(digits))
 
-def parse_cp_to_int(cp: Any) -> Optional[int]:
-    # Backwards-compat: versiones anteriores usaban este nombre
-    return cp_to_int(cp)
-
 
 def ar_money_to_float(x: Any) -> Optional[float]:
+    """Convierte '93.263,21' -> 93263.21"""
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return None
     s = str(x).strip()
@@ -251,136 +133,80 @@ def ar_money_to_float(x: Any) -> Optional[float]:
     s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
-    except ValueError:
-        return None
-
-def apply_rounding(config: Dict[str, Any], v: Optional[float]) -> Optional[float]:
-    if v is None or (isinstance(v, float) and math.isnan(v)):
-        return None
-    rnd = (config.get("rounding") or {})
-    if not rnd.get("enabled", True):
-        return float(v)
-    decimals = int(rnd.get("decimals", 0))
-    mode = str(rnd.get("mode", "round")).lower()
-    factor = 10 ** decimals
-    if mode == "ceil":
-        return math.ceil(float(v) * factor) / factor
-    return round(float(v), decimals)
-
-
-# =========================
-# PDF parsing helpers (v1.41)
-# =========================
-RE_GUIA_LINE = re.compile(r"(?:nro\.?\s*de\s*env[ií]o)\s*:?\s*(\d{10,})", re.IGNORECASE)
-RE_SERVICIO_FECHA = re.compile(r"Servicio de transporte .*?(\d{2}[\./]\d{2}[\./]\d{4})", re.IGNORECASE)
-RE_ANY_FECHA = re.compile(r"(\d{2}[\./]\d{2}[\./]\d{4})")
-
-def _parse_ddmmyyyy(s: str):
-    """Parsea DD.MM.YYYY o DD/MM/YYYY -> date. Devuelve None si falla."""
-    try:
-        s = s.strip()
-        s = s.replace("/", ".")
-        return dt.datetime.strptime(s, "%d.%m.%Y").date()
     except Exception:
         return None
 
-def pick_fecha_around(lines, i, window=8):
-    """
-    Busca una fecha cercana a la línea de la guía.
-    Prioriza fechas en líneas 'Servicio de transporte ... <fecha>'.
-    """
-    lo = max(0, i - window)
-    hi = min(len(lines), i + window + 1)
-
-    candidates = []
-    for j in range(lo, hi):
-        m = RE_SERVICIO_FECHA.search(lines[j])
-        if m:
-            d = _parse_ddmmyyyy(m.group(1))
-            if d:
-                candidates.append((abs(j - i), d))
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-
-    candidates = []
-    for j in range(lo, hi):
-        m = RE_ANY_FECHA.search(lines[j])
-        if m:
-            d = _parse_ddmmyyyy(m.group(1))
-            if d:
-                candidates.append((abs(j - i), d))
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-    return None
 
 def normalize_guia(val: Any) -> Optional[str]:
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
-    if isinstance(val, (int,)) and not isinstance(val, bool):
+    if isinstance(val, int) and not isinstance(val, bool):
         return str(int(val))
-    if isinstance(val, (float,)):
+    if isinstance(val, float):
         if math.isfinite(val) and abs(val - round(val)) < 1e-6:
             return str(int(round(val)))
-        s = format(val, ".0f") if abs(val) > 1e12 else str(val)
-        return s.strip()
+        return str(val).strip()
+
     s = str(val).strip()
     if not s:
         return None
-    try:
-        if re.search(r"[eE]\+?\d+", s):
-            d = Decimal(s)
-            return format(d.quantize(Decimal("1")), "f")
-    except (InvalidOperation, ValueError):
-        pass
+
+    # Evitar notación científica textual
+    if re.search(r"[eE]\+?\d+", s):
+        # no intentamos arreglarla acá: debe venir como texto desde Excel
+        return s
+
     if re.match(r"^\d+\.0+$", s):
         s = s.split(".")[0]
     return s
 
-def to_excel_bytes(df: pd.DataFrame, sheet: str="data") -> bytes:
+
+def to_excel_bytes(df: pd.DataFrame, sheet: str = "data") -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name=sheet[:31])
     return out.getvalue()
 
-# --- Compat: algunos botones llaman esta función vieja ---
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str="data") -> bytes:
-    return to_excel_bytes(df, sheet=sheet_name)
 
-# -----------------------------
-# Backup + borrar + restore
-# -----------------------------
-def backup_file(path: str, label: str) -> Optional[str]:
-    if not os.path.exists(path):
-        return None
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ext = os.path.splitext(path)[1]
-    bpath = os.path.join(BACKUP_DIR, f"{label}_{ts}{ext}")
-    shutil.copy2(path, bpath)
-    return bpath
+def safe_show_df(df: pd.DataFrame, *, label: str = "", max_rows: int = 2000) -> None:
+    if df is None or len(df) == 0:
+        st.info("No hay datos para mostrar.")
+        return
 
-def last_backup_for(label: str) -> Optional[str]:
-    cand = [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR) if f.startswith(label + "_")]
-    if not cand:
-        return None
-    cand.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return cand[0]
+    view = df.copy()
+    try:
+        view = view.reset_index(drop=True)
+    except Exception:
+        pass
 
-def delete_file(path: str) -> None:
-    if os.path.exists(path):
-        os.remove(path)
+    for c in list(view.columns):
+        s = view[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            view[c] = pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m-%d")
+        elif pd.api.types.is_object_dtype(s):
+            view[c] = s.fillna("").astype(str)
 
-def restore_backup(label: str, target_path: str) -> bool:
-    b = last_backup_for(label)
-    if not b:
-        return False
-    shutil.copy2(b, target_path)
-    return True
+    truncated = len(view) > max_rows
+    if truncated:
+        st.dataframe(view.head(max_rows), use_container_width=True)
+        st.warning(f"Mostrando primeras {max_rows} filas (por estabilidad).")
+    else:
+        st.dataframe(view, use_container_width=True)
 
-# -----------------------------
-# Config base
-# -----------------------------
+    try:
+        st.download_button(
+            f"Descargar CSV ({label or 'tabla'})",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{(label or 'tabla').replace(' ', '_').lower()}.csv",
+            mime="text/csv",
+        )
+    except Exception:
+        pass
+
+
+# =========================
+# Config
+# =========================
 DEFAULT_CONFIG_YAML = """app:
   tolerance_weight_kg: 0.01
   tolerance_tariff_ars: 1.0
@@ -406,2156 +232,1297 @@ zones:
   capital_keywords_by_province: {}
 """
 
+
 def load_config(uploaded: Optional[io.BytesIO]) -> Dict[str, Any]:
     if uploaded is None:
+        # si existe config.yaml en el repo, úsalo; si no, default.
+        if os.path.exists(TPL_CONFIG):
+            try:
+                with open(TPL_CONFIG, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f.read())
+            except Exception:
+                return yaml.safe_load(DEFAULT_CONFIG_YAML)
         return yaml.safe_load(DEFAULT_CONFIG_YAML)
+
     raw = uploaded.read().decode("utf-8")
     return yaml.safe_load(raw)
 
-# -----------------------------
-# Audit trail
-# -----------------------------
-def audit_log(action: str, actor: str, payload: Dict[str, Any]) -> None:
-    rec = {"ts": iso_now(), "action": action, "actor": actor, "payload": payload}
-    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
-def read_audit_tail(n: int = 300) -> pd.DataFrame:
-    if not os.path.exists(AUDIT_LOG_PATH):
-        return pd.DataFrame()
-    with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()[-n:]
-    rows = [json.loads(x) for x in lines if x.strip()]
-    return pd.json_normalize(rows).sort_values("ts", ascending=False) if rows else pd.DataFrame()
+# =========================
+# Backup / Persistencia
+# =========================
+def backup_file(path: str, label: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = os.path.splitext(path)[1]
+    bpath = os.path.join(BACKUP_DIR, f"{label}_{ts}{ext}")
+    shutil.copy2(path, bpath)
+    return bpath
 
-# -----------------------------
-# Persistencia datasets
-# -----------------------------
+
 def save_pickle(path: str, obj: Any) -> None:
     pd.to_pickle(obj, path)
+
 
 def load_pickle(path: str) -> Any:
     return pd.read_pickle(path)
 
-def get_cp_master() -> Optional[pd.DataFrame]:
-    return load_pickle(CP_MASTER_PATH) if os.path.exists(CP_MASTER_PATH) else None
 
-def set_cp_master(df: pd.DataFrame) -> None:
-    save_pickle(CP_MASTER_PATH, df)
+def audit_log(action: str, payload: Dict[str, Any]) -> None:
+    rec = {"ts": iso_now(), "action": action, "payload": payload}
+    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
-def get_catalog() -> Optional[pd.DataFrame]:
-    return load_pickle(CATALOG_PATH) if os.path.exists(CATALOG_PATH) else None
 
-def set_catalog(df: pd.DataFrame) -> None:
-    save_pickle(CATALOG_PATH, df)
+# =========================
+# Region key (FIX PRO)
+# =========================
+def normalize_region_key(raw: Any) -> Optional[str]:
+    """
+    Unifica claves de región para matchear con Matriz Andreani (Region ME1):
+    Ejemplos:
+    - 'PATAGONIA I | PAT I 64' -> 'PAT I 64'
+    - 'INTERIOR II IN II 74'   -> 'IN II 74'
+    - 'LOCAL LOC 53'           -> 'LOC 53'
+    - 'SIN REGIÓN ...'         -> None
+    """
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
 
-def get_sales() -> Optional[pd.DataFrame]:
-    return load_pickle(SALES_PATH) if os.path.exists(SALES_PATH) else None
+    # si viene "base | sub" quedate con la sub (derecha)
+    if "|" in s:
+        s = s.split("|")[-1].strip()
 
-def set_sales(df: pd.DataFrame) -> None:
-    save_pickle(SALES_PATH, df)
+    s = re.sub(r"\s+", " ", s).strip().upper()
 
-def default_free_ship() -> Dict[str, List[str]]:
-    return {
-        "Capital": ["A4193","A4400","A4401","A4402","A4404","A4406","A4408","A4410","A4412","A4414"],
-        "Cerrillos": ["A4126","A4400","A4401","A4403","A4421"]
-    }
+    if s.startswith("SIN REGION") or s.startswith("SIN REGIÓN"):
+        return None
+    if "TIERRA" in s and "FUEGO" in s:
+        return "TIERRA DEL FUEGO"
 
-def get_free_ship() -> Dict[str, List[str]]:
-    if os.path.exists(FREE_SHIP_PATH):
-        try:
-            with open(FREE_SHIP_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default_free_ship()
-    return default_free_ship()
+    m = re.search(r"\b(PAT|IN)\s*(I{1,2}|1|2)\s*(\d+)\b", s)
+    if m:
+        band = m.group(2)
+        band = "I" if band == "1" else ("II" if band == "2" else band)
+        return f"{m.group(1)} {band} {int(m.group(3))}"
 
-def save_free_ship(d: Dict[str, List[str]]) -> None:
-    with open(FREE_SHIP_PATH, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+    m = re.search(r"\bLOC\s*(\d+)\b", s)
+    if m:
+        return f"LOC {int(m.group(1))}"
 
-def memory_status() -> pd.DataFrame:
-    rows = []
-    for label, path in [
-        ("CP master", CP_MASTER_PATH),
-        ("Catálogo", CATALOG_PATH),
-        ("Ventas", SALES_PATH),
-        ("Excepciones envío gratis", FREE_SHIP_PATH),
-        ("Registry matrices", REGISTRY_PATH),
-        ("Audit trail", AUDIT_LOG_PATH),
-        ("Backups", BACKUP_DIR),
-    ]:
-        exists = os.path.exists(path)
-        size = 0.0
-        if exists and os.path.isfile(path):
-            size = round(os.path.getsize(path)/1024, 1)
-        rows.append({
-            "Recurso": label,
-            "Ruta": path,
-            "Existe": exists,
-            "Tamaño (KB)": size,
-            "Modificado": dt.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds") if exists else "",
-        })
-    return pd.DataFrame(rows)
+    # fallback: deja lo que venga
+    return s
 
-# -----------------------------
-# Import helpers
-# -----------------------------
-def read_excel_safe(uploaded, converters: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    return pd.read_excel(uploaded, engine="openpyxl", converters=converters)
 
+# =========================
+# Normalizadores de datasets
+# =========================
 def normalize_catalog(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    warnings = []
-    df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
-    required = {"sku","producto","peso_aforado_kg"}
-    missing = sorted(list(required - set(df.columns)))
-    if missing:
-        raise ValueError(f"Faltan columnas: {missing}. Requeridas: {sorted(required)}")
-    df["sku"] = df["sku"].astype(str).str.strip()
-    df["producto"] = df["producto"].astype(str).str.strip()
-    df["peso_aforado_kg"] = pd.to_numeric(df["peso_aforado_kg"], errors="coerce")
-    if df["peso_aforado_kg"].isna().any():
-        raise ValueError("Hay filas con peso_aforado_kg inválido/vacío.")
-    if (df["peso_aforado_kg"] <= 0).any():
-        warnings.append("Hay SKUs con peso_aforado_kg <= 0 (revisar).")
-    if df["sku"].duplicated().any():
-        warnings.append("Hay SKUs repetidos en el catálogo (se toma la última ocurrencia al auditar).")
-    return df.reset_index(drop=True), warnings
-
-def normalize_sales(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Normaliza el import de Ventas.
-    - fecha_envio es OPCIONAL: si falta o es inválida, queda vacía (NaT) y se emite un aviso.
-    - El auditor prioriza fecha_envio (si existe) y, si no, usa la fecha del PDF por guía.
-    """
     warnings: List[str] = []
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
 
-    required = {"guia","cp","sku","qty"}
+    required = {"sku", "producto", "peso_aforado_kg"}
     missing = sorted(list(required - set(df.columns)))
     if missing:
-        raise ValueError(f"Faltan columnas: {missing}. Requeridas: {sorted(required)}")
+        raise ValueError(f"Catálogo: faltan columnas {missing}. Requeridas: {sorted(required)}")
+
+    df["sku"] = df["sku"].astype(str).str.strip()
+    df["producto"] = df["producto"].astype(str).str.strip()
+    df["peso_aforado_kg"] = pd.to_numeric(df["peso_aforado_kg"], errors="coerce")
+
+    if df["peso_aforado_kg"].isna().any():
+        raise ValueError("Catálogo: hay filas con peso_aforado_kg inválido/vacío.")
+    if (df["peso_aforado_kg"] <= 0).any():
+        warnings.append("Catálogo: hay SKUs con peso_aforado_kg <= 0 (revisar).")
+    if df["sku"].duplicated().any():
+        warnings.append("Catálogo: hay SKUs duplicados (se toma la última ocurrencia al auditar).")
+
+    return df.reset_index(drop=True), warnings
+
+
+def normalize_sales(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    required = {"guia", "cp", "sku", "qty"}
+    missing = sorted(list(required - set(df.columns)))
+    if missing:
+        raise ValueError(f"Ventas: faltan columnas {missing}. Requeridas: {sorted(required)}")
 
     df["guia"] = df["guia"].apply(normalize_guia)
     if df["guia"].isna().any():
-        raise ValueError("Hay filas con guia vacía/ilegible.")
+        raise ValueError("Ventas: hay filas con guía vacía/ilegible.")
     if df["guia"].astype(str).str.contains(r"[eE]\+").any():
-        raise ValueError("Hay guías en notación científica. Exportá guías como TEXTO o usá la plantilla.")
+        raise ValueError("Ventas: hay guías en notación científica. Exportalas como TEXTO o usá la plantilla.")
 
     df["sku"] = df["sku"].astype(str).str.strip()
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(float)
 
-    # fecha_envio (opcional)
+    # fecha_envio opcional
     if "fecha_envio" in df.columns:
-        raw_missing = df["fecha_envio"].isna().sum()
         df["fecha_envio"] = pd.to_datetime(df["fecha_envio"], errors="coerce").dt.date
         bad = df["fecha_envio"].isna().sum()
-        if bad > 0 and (len(df) > 0):
-            warnings.append("Aviso: hay filas con fecha_envio inválida o vacía. Se seguirá igual y la auditoría usará la fecha del PDF para esas guías.")
-        # Limpieza: fechas muy viejas (ej. 1970/1980) las anulamos.
+        if bad > 0:
+            warnings.append("Ventas: hay filas con fecha_envio inválida o vacía (se ignora y auditor usa fecha del PDF).")
+        # limpieza de fechas absurdas
         try:
-            too_old = df["fecha_envio"].apply(lambda d: (d is not None) and (not pd.isna(d)) and (d < dt.date(2000,1,1)))
+            too_old = df["fecha_envio"].apply(lambda d: (d is not None) and (not pd.isna(d)) and (d < dt.date(2000, 1, 1)))
             if too_old.any():
                 df.loc[too_old, "fecha_envio"] = pd.NaT
-                warnings.append("Aviso: se detectaron fechas muy viejas en fecha_envio y se anularon (NaT).")
+                warnings.append("Ventas: se detectaron fechas muy viejas en fecha_envio y se anularon (NaT).")
         except Exception:
             pass
     else:
         df["fecha_envio"] = pd.NaT
-        warnings.append("Aviso: no se cargó fecha_envio en ventas (opcional). La auditoría usará la fecha del PDF.")
+        warnings.append("Ventas: no se cargó fecha_envio (opcional). Auditor usa fecha del PDF.")
 
     df["cp"] = df["cp"].astype(str).str.strip()
     df["cp_int"] = df["cp"].apply(parse_cp_to_int)
     if df["cp_int"].isna().any():
-        raise ValueError("Hay filas con CP inválido (ej: A4400, 4400, etc.).")
+        raise ValueError("Ventas: hay CP inválidos.")
 
-    # dedupe: si te pasan varias líneas por guía/sku, lo dejamos tal cual (la auditoría agrupa después)
-    return df, warnings
-
+    return df.reset_index(drop=True), warnings
 
 
-def normalize_cp_master(df: pd.DataFrame):
-    """Normaliza CP Master.
-
-    Requeridos: CP, Provincia, Localidad.
-    Opcional: Region/Región (si no viene, se calcula con una regla por Provincia/Localidad).
-    Agrega: CP_int (numérico) y region (INTERIOR I/II o PATAGONIA I/II).
+def normalize_cp_master(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
+    Formato objetivo (igual a CP MASTER 26.xlsx):
+      - CP
+      - Provincia
+      - Localidad
+      - region_base
+      - sub_region
+
+    Calculadas por la app:
+      - CP_int
+      - region_key (normalizada desde sub_region)
+    """
+    warnings: List[str] = []
     df = df.copy()
 
-    # --- Normalización de encabezados (para que no falle por mayúsculas/minúsculas) ---
-    # Acepta: CP/cp, Provincia/provincia, Localidad/localidad, Region/region/región, etc.
+    # Renombrado tolerante por si vienen variaciones de header
     rename: Dict[str, str] = {}
     for c in list(df.columns):
-        nc = norm_text(str(c))
-        # norm_text devuelve minúsculas sin acentos y con espacios normalizados
-        if nc in {"cp", "codigo postal", "codigopostal", "cod postal", "codpostal", "cpostal", "zip", "postal"}:
+        nc = norm_text(c)
+        if nc in {"cp", "codigo postal", "codigopostal", "cod postal", "codpostal", "cpostal"}:
             rename[c] = "CP"
         elif nc in {"provincia", "prov", "state", "estado"}:
             rename[c] = "Provincia"
         elif nc in {"localidad", "ciudad", "local"}:
             rename[c] = "Localidad"
-        elif nc in {"region", "reg", "zona"}:
-            rename[c] = "Region"
+        elif nc in {"region base", "region_base", "regionbase"}:
+            rename[c] = "region_base"
+        elif nc in {"sub region", "sub_region", "subregion", "sub region me1"}:
+            rename[c] = "sub_region"
+
     if rename:
         df = df.rename(columns=rename)
 
-
-    required = {"CP", "Provincia", "Localidad"}
-    if not required.issubset(set(df.columns)):
-        found = sorted([str(c) for c in df.columns])
-        raise ValueError(f"CP Master debe tener columnas: {sorted(required)}. Encontradas: {found}")
-
-    # Detectar columna de región (opcional)
-    reg_col = None
-    for c in df.columns:
-        if norm_text(c) == "region":
-            reg_col = c
-            break
-
-    if reg_col is not None:
-        df["region"] = df[reg_col].apply(lambda x: None if (x is None or (isinstance(x, float) and math.isnan(x))) else str(x).strip())
-        # Normalizar strings vacíos
-        df.loc[df["region"].astype(str).str.lower().isin({"nan", "none", ""}), "region"] = None
-    else:
-        df["region"] = None
+    required = {"CP", "Provincia", "Localidad", "region_base", "sub_region"}
+    missing = sorted(list(required - set(df.columns)))
+    if missing:
+        raise ValueError(f"CP Master: faltan columnas {missing}. Debe ser EXACTO: {sorted(required)}")
 
     # CP_int
     df["CP_int"] = df["CP"].apply(parse_cp_to_int)
     if df["CP_int"].isna().any():
         bad = df[df["CP_int"].isna()][["CP"]].head(20).to_dict(orient="records")
-        raise ValueError(f"Hay CP inválidos en CP Master (primeros 20): {bad}")
+        raise ValueError(f"CP Master: hay CP inválidos (primeros 20): {bad}")
 
-    # Helpers
-    _allowed = {'PATAGONIA I','PATAGONIA II','INTERIOR I','INTERIOR II','LOCAL','TIERRA DEL FUEGO','TIERRA DEL FUEGO I','TIERRA DEL FUEGO II'}
-    _region_map = {
-        "INTERIORI": "INTERIOR I",
-        "INTERIOR1": "INTERIOR I",
-        "INTERIORII": "INTERIOR II",
-        "INTERIOR 2": "INTERIOR II",
-        "PATAGONIAI": "PATAGONIA I",
-        "PATAGONIA1": "PATAGONIA I",
-        "PATAGONIAII": "PATAGONIA II",
-        "PATAGONIA2": "PATAGONIA II",
-    }
+    # region_key: SOLO desde sub_region (porque querés que sea tal cual)
+    df["region_key"] = df["sub_region"].apply(normalize_region_key)
 
-    def _norm_region(v: Any) -> Optional[str]:
-        if v is None:
-            return None
-        s = str(v).strip()
-        if not s or s.lower() in {"nan", "none"}:
-            return None
-        s = re.sub(r"\s+", " ", norm_text(s).upper()).strip()
-        # map tolerante (sin espacios)
-        s = _region_map.get(s.replace(" ", ""), s)
-        return s
+    # Validación: si sub_region viene vacío, avisamos (no frenamos, pero queda sin tarifar)
+    if df["region_key"].isna().any():
+        warnings.append("CP Master: hay CPs con sub_region vacío o inválido → esos envíos no van a tarifar (SIN REGIÓN).")
 
-    def _derive_region(provincia: Any, localidad: Any) -> str:
-        prov_norm = norm_text(provincia).upper()
-        loc_norm = norm_text(localidad).upper()
-
-        is_pat = prov_norm in PATAGONIA_PROVS_FALLBACK
-        prefix = "PATAGONIA" if is_pat else "INTERIOR"
-
-        if prov_norm in TDF_PROVS_FALLBACK:
-            return "TIERRA DEL FUEGO"
-
-        if prov_norm in {"CAPITAL FEDERAL", "CABA", "CIUDAD AUTONOMA DE BUENOS AIRES"} or loc_norm.startswith("CABA"):
-            return f"{prefix} I"
-
-        # Heurística por "capital" de provincia (tokens típicos)
-        cap_dict = {
-            "BUENOS AIRES": ["LA PLATA"],
-            "CATAMARCA": ["SAN FERNANDO", "CATAMARCA"],
-            "CHACO": ["RESISTENCIA"],
-            "CHUBUT": ["RAWSON"],
-            "CORDOBA": ["CORDOBA"],
-            "CORRIENTES": ["CORRIENTES"],
-            "ENTRE RIOS": ["PARANA"],
-            "FORMOSA": ["FORMOSA"],
-            "JUJUY": ["SAN SALVADOR"],
-            "LA PAMPA": ["SANTA ROSA"],
-            "LA RIOJA": ["LA RIOJA"],
-            "MENDOZA": ["MENDOZA"],
-            "MISIONES": ["POSADAS"],
-            "NEUQUEN": ["NEUQUEN"],
-            "RIO NEGRO": ["VIEDMA"],
-            "SALTA": ["SALTA"],
-            "SAN JUAN": ["SAN JUAN"],
-            "SAN LUIS": ["SAN LUIS"],
-            "SANTA CRUZ": ["RIO GALLEGOS"],
-            "SANTA FE": ["SANTA FE"],
-            "SANTIAGO DEL ESTERO": ["SANTIAGO DEL ESTERO"],
-            "TIERRA DEL FUEGO": ["USHUAIA", "RIO GRANDE"],
-            "TUCUMAN": ["SAN MIGUEL", "TUCUMAN"],
-        }
-        tokens = cap_dict.get(prov_norm, [])
-        if any(t in loc_norm for t in tokens):
-            return f"{prefix} I"
-        return f"{prefix} II"
-
-    df["region"] = df["region"].apply(_norm_region)
-    missing = df["region"].isna()
-    if missing.any():
-        df.loc[missing, "region"] = df.loc[missing].apply(lambda r: _derive_region(r["Provincia"], r["Localidad"]), axis=1)
-
-    bad_vals = sorted(set(df["region"].dropna()) - _allowed)
-    if bad_vals:
-        raise ValueError(f"Valores de región inválidos en CP Master: {bad_vals}. Permitidos: {sorted(_allowed)}")
-
+    # Duplicados de CP
     if df["CP_int"].duplicated().any():
         dups = df[df["CP_int"].duplicated(keep=False)].sort_values("CP_int")[["CP", "Provincia", "Localidad", "CP_int"]].head(30)
-        raise ValueError(f"Hay CP repetidos en CP Master (primeros):\n{dups.to_string(index=False)}")
+        raise ValueError(f"CP Master: hay CP repetidos (primeros):\n{dups.to_string(index=False)}")
 
-    df = df[["CP", "Provincia", "Localidad", "region", "CP_int"]].copy()
-    return df
+    # Output CANON: tus 5 columnas + calculadas
+    out_cols = ["CP", "Provincia", "Localidad", "region_base", "sub_region", "CP_int", "region_key"]
+    return df[out_cols].reset_index(drop=True), warnings
 
-def sales_sanity(df: pd.DataFrame) -> Dict[str, Any]:
-    return {
-        "filas": int(len(df)),
-        "guias_unicas": int(df["guia"].nunique()),
-        "fecha_min": str(min(df["fecha_envio"])) if len(df) else "",
-        "fecha_max": str(max(df["fecha_envio"])) if len(df) else "",
-        "ejemplo_guias": df["guia"].head(8).tolist(),
-        "ejemplo_cp": df["cp"].head(8).tolist(),
-        "ejemplo_skus": df["sku"].head(8).tolist(),
-    }
 
-# -----------------------------
-# Matrices (versionado básico, sin cambios grandes respecto v1.50)
-# -----------------------------
-def parse_weight_band(col: str) -> Optional[Tuple[float,float]]:
+
+# =========================
+# Matriz Andreani (normalizada)
+# =========================
+def parse_weight_band(col: str) -> Optional[Tuple[float, float]]:
     m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", str(col))
     if not m:
         return None
     return float(m.group(1)), float(m.group(2))
 
-SCHEMA_ML = {
-    "CP Inicio": "cp_from",
-    "CP Fin": "cp_to",
-    "Peso Mínimo (kg)": "w_min",
-    "Peso Máximo (kg)": "w_max",
-    "Valor Flete Peso ($)": "base_cost",
-    "Valor p/ kg excedente ($)": "extra_per_kg",
-}
-SCHEMA_BNA = {
-    "zip_from": "cp_from",
-    "zip_to": "cp_to",
-    "weight_min": "w_min",
-    "weight_max": "w_max",
-    "price": "base_cost",
-}
 
-def normalize_tariffs_any(df: pd.DataFrame) -> Tuple[str, pd.DataFrame, Dict[str,Any]]:
-    cols = [c.strip() for c in df.columns]
-    df = df.copy(); df.columns = cols
-
-    if "Region ME1" in df.columns and any(re.match(r"^\s*\d+\s*-\s*\d+\s*$", c) for c in df.columns):
-        band_cols = [c for c in df.columns if parse_weight_band(c)]
-        if "Exc" not in df.columns:
-            raise ValueError("Formato Andreani: falta columna 'Exc'.")
-        out_rows = []
-        for region, g in df.groupby("Region ME1", sort=False):
-            g = g.reset_index(drop=True)
-            for i, row in g.iterrows():
-                tier_id = i + 1
-                exc = pd.to_numeric(row.get("Exc"), errors="coerce")
-                for bc in band_cols:
-                    w1, w2 = parse_weight_band(bc)
-                    cost = pd.to_numeric(row.get(bc), errors="coerce")
-                    if pd.isna(cost):
-                        continue
-                    out_rows.append({
-                        "region": str(region).strip().upper(),
-                        "tier_id": int(tier_id),
-                        "w_from": float(w1),
-                        "w_to": float(w2),
-                        "cost": float(cost),
-                        "exc_per_kg": None if pd.isna(exc) else float(exc),
-                    })
-        norm = pd.DataFrame(out_rows)
-        if norm.empty:
-            raise ValueError("No pude normalizar la matriz Andreani (sin datos).")
-        return "andreani_region", norm, {"regions": sorted(norm["region"].unique().tolist()), "band_cols": band_cols}
-
-# -----------------------------
-# Auditoría de facturas Andreani (PDF)
-# -----------------------------
-def ar_num(x: str) -> Optional[float]:
-    """Convierte números AR (46.241,40) a float."""
-    if x is None:
-        return None
-    s = str(x).strip()
-    if s == "":
-        return None
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def parse_date_ddmmyyyy_dots(s: str) -> Optional[dt.date]:
-    """Parsea fechas en formato DD.MM.YYYY o DD/MM/YYYY y devuelve date.
-
-    Nota: Andreani usa DD.MM.YYYY en el detalle (ej: 03.11.2025).
+def normalize_andreani_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    m = re.search(r"(\d{2})[\./](\d{2})[\./](\d{4})", str(s))
-    if not m:
-        return None
-    d, mo, y = map(int, m.groups())
-    try:
-        return dt.date(y, mo, d)
-    except Exception:
-        return None
-def parse_invoice_pdf_bytes(pdf_bytes: bytes) -> pd.DataFrame:
+    Espera formato típico:
+      - 'Region ME1' (o similar)
+      - columnas '0-1', '1-5', etc
+      - 'Exc' (excedente por kg)
+    Devuelve long:
+      region_key, w_from, w_to, cost, exc_per_kg
     """
-    Parser por texto (pdfplumber) para facturas Andreani.
-    Robusto a saltos de página: asocia líneas de servicio a la guía por bloque entre guías.
-
-    Extrae por guía:
-      - fecha_factura (fecha de envío del renglón 'Servicio de transporte ... <fecha>')
-      - bultos_factura
-      - kg_factura
-      - disd_factura (Imp. Neto ARS de DISD)
-      - sgd_factura (Imp. Neto ARS de SGD)
-      - invoice_issue_date (header 'Fecha:')
-    """
-    try:
-        import pdfplumber  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Falta dependencia pdfplumber. Instalá con: pip install pdfplumber") from e
-
-    pages_text = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            pages_text.append(p.extract_text() or "")
-
-    # Armamos líneas preservando cortes de página (útil para debug)
-    lines = []
-    for pi, txt in enumerate(pages_text):
-        for raw in txt.splitlines():
-            ln = " ".join(str(raw).replace("\xa0", " ").split()).strip()
-            if ln:
-                lines.append(ln)
-        if pi < len(pages_text)-1:
-            lines.append("<<PAGE_BREAK>>")
-
-    # Fecha de emisión de factura (header) — buscar en primeras páginas
-    invoice_issue_date = None
-    for ln in lines[:250]:
-        mh = re.search(r"\bFecha:\s*(\d{2}[\./]\d{2}[\./]\d{4})\b", ln)
-        if mh:
-            invoice_issue_date = parse_date_ddmmyyyy_dots(mh.group(1).replace("/","."))
-            if invoice_issue_date:
-                break
-
-    date_token_re = re.compile(r"\b(\d{2}[\./]\d{2}[\./]\d{4})\b")
-    money_token_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}$")
-    guia_re = re.compile(r"(?:Nro\.?\s*de\s*Envío)\s*:?\s*(\d{10,})", re.IGNORECASE)
-
-    def parse_float_ar(tok: str):
-        try:
-            return float(tok.replace(".","").replace(",", "."))
-        except Exception:
-            return None
-
-    def parse_service_line(ln: str):
-        if "Servicio de transporte" not in ln:
-            return None
-        if "<<PAGE_BREAK>>" in ln:
-            return None
-        svc = None
-        if " DISD" in (" "+ln):
-            svc = "DISD"
-        elif " SGD" in (" "+ln):
-            svc = "SGD"
-        else:
-            return None
-
-        md = date_token_re.search(ln)
-        d = None
-        if md:
-            d = parse_date_ddmmyyyy_dots(md.group(1).replace("/","."))
-
-        toks = ln.split()
-        date_idx = None
-        for i,t in enumerate(toks):
-            if date_token_re.fullmatch(t):
-                date_idx = i
-                break
-
-        bultos = None
-        kg = None
-        if date_idx is not None:
-            if date_idx+1 < len(toks) and toks[date_idx+1].isdigit():
-                bultos = int(toks[date_idx+1])
-            if date_idx+2 < len(toks):
-                kg = parse_float_ar(toks[date_idx+2])
-            if kg is None:
-                for t in toks[date_idx+1: min(len(toks), date_idx+12)]:
-                    if re.search(r"\d+,\d+", t):
-                        kg = parse_float_ar(t)
-                        if kg is not None:
-                            break
-
-        imp = None
-        for t in reversed(toks[-10:]):
-            if money_token_re.match(t):
-                try:
-                    imp = ar_num(t)
-                except Exception:
-                    imp = None
-                break
-
-        return {"svc": svc, "fecha": d, "bultos": bultos, "kg": kg, "imp": imp}
-
-    # indexar líneas
-    guide_marks = []
-    service_marks = []
-    for i, ln in enumerate(lines):
-        mg = guia_re.search(ln)
-        if mg:
-            guide_marks.append((i, normalize_guia(mg.group(1))))
-        svc = parse_service_line(ln)
-        if svc:
-            service_marks.append((i, svc))
-
-    if not guide_marks:
-        return pd.DataFrame()
-
-    # para lookup rápido: services por índice
-    svc_by_i = {i: s for i, s in service_marks}
-
-    rows = []
-    for gi, guia in guide_marks:
-        prev_gi = -1
-        next_gi = len(lines)
-        # find previous/next guide indices
-        for j in range(len(guide_marks)):
-            if guide_marks[j][0] == gi:
-                if j > 0:
-                    prev_gi = guide_marks[j-1][0]
-                if j < len(guide_marks)-1:
-                    next_gi = guide_marks[j+1][0]
-                break
-
-        # prefer services BEFORE guide (usual case)
-        candidate_idx = [i for i in svc_by_i.keys() if prev_gi < i < gi]
-        # if none, take AFTER guide until next guide (page-break weirdness)
-        if len(candidate_idx) == 0:
-            candidate_idx = [i for i in svc_by_i.keys() if gi < i < next_gi]
-
-        # sort in document order
-        candidate_idx.sort()
-
-        fecha = None
-        bultos = None
-        kg = None
-        disd = 0.0
-        sgd = 0.0
-        have_any = False
-
-        for i in candidate_idx:
-            s = svc_by_i[i]
-            have_any = True
-            if s.get("fecha") and not fecha:
-                fecha = s["fecha"]
-            if s.get("bultos") is not None and bultos is None:
-                bultos = s["bultos"]
-            if s.get("kg") is not None and kg is None:
-                kg = s["kg"]
-            if s.get("imp") is not None:
-                if s["svc"] == "DISD":
-                    disd += float(s["imp"])
-                else:
-                    sgd += float(s["imp"])
-
-        rows.append({
-            "guia": guia,
-            "fecha_factura": fecha,
-            "bultos_factura": bultos,
-            "kg_factura": kg,
-            "disd_factura": disd if have_any else None,
-            "sgd_factura": sgd if have_any else None,
-            "invoice_issue_date": invoice_issue_date,
-        })
-
-    df = pd.DataFrame(rows)
-    # de-dupe por guía
-    df["_score"] = (
-        df["fecha_factura"].notna().astype(int) * 10 +
-        df["kg_factura"].notna().astype(int) * 5 +
-        df["disd_factura"].notna().astype(int) * 3 +
-        df["sgd_factura"].notna().astype(int) * 2
-    )
-    df = df.sort_values(["guia","_score"], ascending=[True,False]).drop_duplicates(subset=["guia"]).drop(columns=["_score"])
-    return df
-
-
-
-
-def normalize_cp_master_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Deja CP master listo para lookup:
-      - Acepta CP con separadores (ej. 1,071) y CPA alfanumérico (A4400)
-      - Genera CP_int (entero) para matching rápido
-      - Estandariza columnas Provincia / Localidad
-    """
-    if df is None or df.empty:
-        return df
-
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [c.strip() for c in df.columns]
 
-    # CP
-    cp_col = None
-    for c in ["CP", "cp", "codigo_postal", "codigo postal", "postal_code", "postal code"]:
-        if c in df.columns:
-            cp_col = c
-            break
-    if cp_col is None:
-        return df
-
-    # provincia/localidad
-    prov_col = None
-    for c in ["Provincia", "provincia", "PROVINCIA"]:
-        if c in df.columns:
-            prov_col = c
-            break
-    loc_col = None
-    for c in ["Localidad", "localidad", "LOCALIDAD"]:
-        if c in df.columns:
-            loc_col = c
-            break
-
-    df["CP"] = df[cp_col].astype(str).str.strip()
-    df["CP_int"] = df["CP"].apply(cp_to_int).astype("Int64")
-    if prov_col and prov_col != "Provincia":
-        df = df.rename(columns={prov_col: "Provincia"})
-    if loc_col and loc_col != "Localidad":
-        df = df.rename(columns={loc_col: "Localidad"})
-
-    df = df[df["CP_int"].notna()].copy()
-    return df
-
-def region_from_cp(cp: str, cp_master: pd.DataFrame, config: dict | None = None):
-    """
-    Devuelve (region, provincia, localidad) para un CP.
-
-    Prioridad:
-      1) Si CP Master trae columna Region, se usa (normalizada).
-      2) Si falta Region, se infiere con reglas de zona (Patagonia/Interior I/II) + TDF + LOCAL configurable.
-    """
-    if cp_master is None or cp_master.empty or cp is None:
-        return ("SIN REGIÓN (CP no mapea)", None, None)
-
-    # columnas (tolerante a mayúsculas/minúsculas)
-    cols = {str(c).strip().lower(): c for c in cp_master.columns}
-    col_cp_int = cols.get("cp_int")
-    col_cp = cols.get("cp")
-    col_prov = cols.get("provincia")
-    col_loc = cols.get("localidad")
-    col_reg = cols.get("region")  # <- clave correcta (antes estaba 'REGION')
-
-    cp_int = cp_to_int(cp)
-    if cp_int is None:
-        return ("SIN REGIÓN (CP no mapea)", None, None)
-
-    base = cp_master
-    if col_cp_int in base.columns:
-        hit = base[base[col_cp_int] == cp_int]
-    elif col_cp in base.columns:
-        hit = base[base[col_cp].astype(str).str.replace(r"\D", "", regex=True).astype("Int64") == cp_int]
-    else:
-        hit = base.iloc[0:0]
-
-    if hit.empty:
-        return ("SIN REGIÓN (CP no mapea)", None, None)
-
-    row = hit.iloc[0]
-    provincia = row[col_prov] if col_prov in base.columns else None
-    localidad = row[col_loc] if col_loc in base.columns else None
-
-    def _norm_region(val: str) -> str:
-        r = norm_text(val).upper()
-        r = re.sub(r"\s+", " ", r).strip()
-        # Aceptamos variantes con I/II y las consolidamos
-        if r.startswith("TIERRA DEL FUEGO"):
-            return "TIERRA DEL FUEGO"
-        return r
-
-    # 1) si viene region en CP Master, usarla
-    if col_reg in base.columns:
-        raw_reg = row[col_reg]
-        if pd.notna(raw_reg) and str(raw_reg).strip():
-            return (_norm_region(str(raw_reg)), provincia, localidad)
-
-    # 2) inferencia (con config)
-    zones = (config or {}).get("zones", {}) if isinstance(config, dict) else {}
-
-    # LOCAL configurable por CP o localidad (opcional)
-    local_cps = set(str(x).strip() for x in zones.get("local_cps", []) if str(x).strip())
-    local_locs = set(norm_text(str(x)) for x in zones.get("local_localidades", []) if str(x).strip())
-
-    cp_digits = str(cp_int)
-    loc_norm = norm_text(localidad) if pd.notna(localidad) else ""
-    if (cp_digits in local_cps) or (loc_norm in local_locs):
-        return ("LOCAL", provincia, localidad)
-
-    prov_norm = norm_text(provincia) if pd.notna(provincia) else ""
-
-    # TIERRA DEL FUEGO como región propia (no Patagonia)
-    tdf_name = zones.get("tierra_del_fuego_province", "Tierra del Fuego")
-    if prov_norm and prov_norm == norm_text(tdf_name):
-        return ("TIERRA DEL FUEGO", provincia, localidad)
-
-    # Patagonia (sin Tierra del Fuego)
-    pat_list = zones.get("patagonia_provinces", [])
-    pat_set = set(norm_text(p) for p in pat_list if str(p).strip())
-    prefix = "PATAGONIA" if (prov_norm and prov_norm in pat_set) else "INTERIOR"
-
-    # Capital vs interior: si no podemos determinar, asumimos II (conservador)
-    cap_map = globals().get("CAPITAL_BY_PROV", {}) or {}
-    cap = cap_map.get(prov_norm) if prov_norm else None
-
-    capital_tokens = ["CABA", "CAPITAL", "CAP. FEDERAL", "CAP FEDERAL", "CAP."]  # heurística
-    is_capital = False
-    if loc_norm:
-        if cap and loc_norm == cap:
-            is_capital = True
-        if any(tok in loc_norm.upper() for tok in capital_tokens):
-            is_capital = True
-
-    band = "I" if is_capital else "II"
-    return (f"{prefix} {band}", provincia, localidad)
-
-def expected_disd_from_raw(raw_matrix: pd.DataFrame, region: str, weight_kg: float) -> Optional[float]:
-    """
-    Esperado conservador: toma el MAX posible entre todas las filas (tier_id) para esa región.
-    """
-    if raw_matrix is None or raw_matrix.empty or region is None or pd.isna(weight_kg):
-        return None
-    df = raw_matrix.copy()
-    df["region"] = df["region"].astype(str).str.upper()
-    region = str(region).strip().upper()
-    df = df[df["region"] == region].copy()
-    if df.empty:
-        return None
-
-    # Para cada fila, computar costo según tramo o excedente
-    max_w = df["w_to"].max()
-    def cost_row(r):
-        w = float(weight_kg)
-        if w <= float(r["w_to"]):
-            # buscar banda exacta en esa misma fila
-            hit = df[(df.get("tier_id", -1) == r.get("tier_id", -1)) & (df["w_from"] <= w) & (w <= df["w_to"])]
-            if not hit.empty:
-                return float(hit.iloc[0]["cost"])
-            return None
-        # excedente: tomar última banda de esa fila + exc
-        last = df[(df.get("tier_id",-1)==r.get("tier_id",-1)) & (df["w_to"]==max_w)]
-        if last.empty:
-            return None
-        base = float(last.iloc[0]["cost"])
-        exc = last.iloc[0].get("exc_per_kg")
-        if pd.isna(exc) or exc is None:
-            return base
-        return base + float(exc) * max(0.0, (w - float(max_w)))
-
-    vals = []
-    for _, r in df.drop_duplicates(subset=["tier_id"]).iterrows():
-        v = cost_row(r)
-        if v is not None and not pd.isna(v):
-            vals.append(float(v))
-    if not vals:
-        return None
-    return float(max(vals))
-
-def expected_sgd(valor_declarado: Optional[float], base_hasta: float, base_costo: float, excedente_pct: float) -> Optional[float]:
-    if valor_declarado is None or pd.isna(valor_declarado):
-        return None
-    v = float(valor_declarado)
-    if v <= base_hasta:
-        return float(base_costo)
-    return float(base_costo) + float(excedente_pct) * max(0.0, v - float(base_hasta))
-
-
-    if set(SCHEMA_ML.keys()).issubset(set(df.columns)):
-        out = df.rename(columns=SCHEMA_ML).copy()
-        if "extra_per_kg" not in out.columns:
-            out["extra_per_kg"] = None
-        out["base_cost"] = out["base_cost"].apply(ar_money_to_float).astype(float)
-        out["extra_per_kg"] = out["extra_per_kg"].apply(ar_money_to_float)
-        out["cp_from"] = out["cp_from"].apply(parse_cp_to_int)
-        out["cp_to"] = out["cp_to"].apply(parse_cp_to_int)
-        out["w_min"] = pd.to_numeric(out["w_min"], errors="coerce").astype(float)
-        out["w_max"] = pd.to_numeric(out["w_max"], errors="coerce").astype(float)
-        out = out.dropna(subset=["cp_from","cp_to","w_min","w_max","base_cost"]).copy()
-        out["cp_from"] = out["cp_from"].astype(int); out["cp_to"] = out["cp_to"].astype(int)
-        return "cp_ranges", out.sort_values(["cp_from","cp_to","w_min","w_max"]).reset_index(drop=True), {}
-
-    if set(SCHEMA_BNA.keys()).issubset(set(df.columns)):
-        out = df.rename(columns=SCHEMA_BNA).copy()
-        out["extra_per_kg"] = None
-        out["base_cost"] = pd.to_numeric(out["base_cost"], errors="coerce").astype(float)
-        out["cp_from"] = out["cp_from"].apply(parse_cp_to_int)
-        out["cp_to"] = out["cp_to"].apply(parse_cp_to_int)
-        out["w_min"] = pd.to_numeric(out["w_min"], errors="coerce").astype(float)
-        out["w_max"] = pd.to_numeric(out["w_max"], errors="coerce").astype(float)
-        out = out.dropna(subset=["cp_from","cp_to","w_min","w_max","base_cost"]).copy()
-        out["cp_from"] = out["cp_from"].astype(int); out["cp_to"] = out["cp_to"].astype(int)
-        return "cp_ranges", out.sort_values(["cp_from","cp_to","w_min","w_max"]).reset_index(drop=True), {}
-
-    raise ValueError("Formato de matriz no reconocido.")
-
-def validate_matrix(matrix_type: str, df_norm: pd.DataFrame) -> Dict[str, Any]:
-    rep: Dict[str, Any] = {"errors": [], "warnings": [], "stats": {"rows": int(len(df_norm))}}
-    if matrix_type == "cp_ranges":
-        if (df_norm["cp_from"] > df_norm["cp_to"]).any():
-            rep["errors"].append("Hay filas con cp_from > cp_to.")
-        if (df_norm["w_min"] > df_norm["w_max"]).any():
-            rep["errors"].append("Hay filas con w_min > w_max.")
-        if df_norm["base_cost"].isna().any():
-            rep["errors"].append("Hay filas con base_cost vacío.")
-    else:
-        if (df_norm["w_from"] > df_norm["w_to"]).any():
-            rep["errors"].append("Hay filas con w_from > w_to.")
-    return rep
-
-
-# -----------------------------
-# Registry helpers (editar / publicar / duplicar / borrar)
-# -----------------------------
-def sanitize_name_for_file(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", str(name))
-
-def _find_registry_index(reg: List[Dict[str, Any]], name: str) -> Optional[int]:
-    for i, e in enumerate(reg):
-        if e.get("name") == name:
-            return i
-    return None
-
-def update_matrix_entry(name: str, actor: str, updates: Dict[str, Any]) -> None:
-    """
-    Edita metadata de una versión (status / vigencia / notas, etc).
-    Guarda diff (antes/después) en audit trail.
-    """
-    reg = ensure_registry_defaults(load_registry())
-    idx = _find_registry_index(reg, name)
-    if idx is None:
-        raise ValueError(f"No existe la versión: {name}")
-    before = json.loads(json.dumps(reg[idx], ensure_ascii=False, default=str))
-    for k, v in updates.items():
-        reg[idx][k] = v
-    reg[idx]["updated_at"] = iso_now()
-    save_registry(reg)
-    after = json.loads(json.dumps(reg[idx], ensure_ascii=False, default=str))
-    audit_log("matrix_update", actor, {"name": name, "before": before, "after": after})
-    load_matrix_from_disk.clear()
-
-def duplicate_matrix_version(src_name: str, new_name: str, actor: str, tweaks: Dict[str, Any]) -> None:
-    """
-    Duplica una versión: copia el .pkl y crea nueva entrada en registry.
-    Por default crea DRAFT (salvo que tweaks lo cambie).
-    """
-    reg = ensure_registry_defaults(load_registry())
-    idx = _find_registry_index(reg, src_name)
-    if idx is None:
-        raise ValueError(f"No existe la versión origen: {src_name}")
-    if _find_registry_index(reg, new_name) is not None:
-        raise ValueError("Ya existe una versión con ese nombre.")
-    src = reg[idx]
-    df = load_matrix_from_disk(src["path"])
-    new_path = save_matrix_to_disk(new_name, df)
-
-    created_at = iso_now()
-    entry = {
-        "name": new_name,
-        "marketplace": src.get("marketplace"),
-        "kind": src.get("kind", "RAW"),
-        "valid_from": src.get("valid_from"),
-        "valid_to": src.get("valid_to"),
-        "created_at": created_at,
-        "updated_at": created_at,
-        "path": new_path,
-        "status": "DRAFT",
-        "actor": actor,
-        "meta": json.loads(json.dumps(src.get("meta") or {}, ensure_ascii=False)),
-    }
-    for k, v in (tweaks or {}).items():
-        if k == "meta" and isinstance(v, dict):
-            entry["meta"].update(v)
+    if "Region ME1" not in df.columns:
+        # intentamos encontrar alguna variante
+        cand = [c for c in df.columns if norm_text(c) in {"region me1", "regionme1", "region"}]
+        if cand:
+            df = df.rename(columns={cand[0]: "Region ME1"})
         else:
-            entry[k] = v
-    reg.append(entry)
-    save_registry(reg)
-    audit_log("matrix_duplicate", actor, {"src": src_name, "new": new_name, "tweaks": tweaks})
-    load_matrix_from_disk.clear()
+            raise ValueError("Matriz Andreani: falta columna 'Region ME1'.")
 
-def delete_matrix_version(name: str, actor: str) -> None:
-    """
-    Elimina una versión SOLO si está en DRAFT. También borra el pkl.
-    """
-    reg = ensure_registry_defaults(load_registry())
-    idx = _find_registry_index(reg, name)
-    if idx is None:
-        raise ValueError(f"No existe la versión: {name}")
-    entry = reg[idx]
-    if str(entry.get("status","")).upper() != "DRAFT":
-        raise ValueError("Solo se puede eliminar una versión en DRAFT (para no romper auditoría).")
-    try:
-        if entry.get("path") and os.path.exists(entry["path"]):
-            safe = sanitize_name_for_file(name)
-            backup_file(entry["path"], f"matrixfile_{safe}")
-            os.remove(entry["path"])
-    except Exception:
-        pass
-    before = json.loads(json.dumps(entry, ensure_ascii=False))
-    reg.pop(idx)
-    save_registry(reg)
-    audit_log("matrix_delete", actor, {"name": name, "before": before})
-    load_matrix_from_disk.clear()
+    band_cols = [c for c in df.columns if parse_weight_band(c)]
+    if not band_cols:
+        raise ValueError("Matriz Andreani: no detecté columnas de bandas de peso tipo '0-1', '1-5', etc.")
+    if "Exc" not in df.columns:
+        raise ValueError("Matriz Andreani: falta columna 'Exc' (excedente por kg).")
 
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        region_raw = r.get("Region ME1")
+        region_key = normalize_region_key(region_raw) or str(region_raw).strip().upper()
+        exc = pd.to_numeric(r.get("Exc"), errors="coerce")
 
-def rename_matrix_version(old_name: str, new_name: str, actor: str) -> None:
-    """
-    Renombra una versión: actualiza el registry y (si es posible) renombra el archivo .pkl.
-    Mantiene el contenido idéntico, solo cambia identificador 'name' y path.
-    """
-    old_name = str(old_name).strip()
-    new_name = str(new_name).strip()
-    if not old_name or not new_name:
-        raise ValueError("Nombre inválido.")
-    if old_name == new_name:
-        return
-
-    reg = ensure_registry_defaults(load_registry())
-    idx_old = _find_registry_index(reg, old_name)
-    if idx_old is None:
-        raise ValueError(f"No existe la versión: {old_name}")
-    if _find_registry_index(reg, new_name) is not None:
-        raise ValueError("Ya existe una versión con ese nombre.")
-
-    before = json.loads(json.dumps(reg[idx_old], ensure_ascii=False))
-
-    # Renombrar archivo: si la ruta actual es un .pkl dentro de DATA_DIR, lo movemos.
-    old_path = reg[idx_old].get("path")
-    new_path = old_path
-    try:
-        if old_path and os.path.exists(old_path):
-            base_dir = os.path.dirname(old_path)
-            ext = os.path.splitext(old_path)[1] or ".pkl"
-            # archivo nuevo basado en nombre
-            safe = sanitize_name_for_file(new_name)
-            candidate = os.path.join(base_dir, f"{safe}{ext}")
-            # evitar pisar
-            if os.path.abspath(candidate) != os.path.abspath(old_path):
-                # backup por seguridad
-                backup_file(old_path, f"before_rename_{sanitize_name_for_file(old_name)}")
-                os.replace(old_path, candidate)
-                new_path = candidate
-    except Exception:
-        # si no se puede mover, igual renombramos la entrada y dejamos el path tal cual
-        new_path = old_path
-
-    reg[idx_old]["name"] = new_name
-    reg[idx_old]["path"] = new_path
-    reg[idx_old]["updated_at"] = iso_now()
-    save_registry(reg)
-
-    after = json.loads(json.dumps(reg[idx_old], ensure_ascii=False))
-    audit_log("matrix_rename", actor, {"old": old_name, "new": new_name, "before": before, "after": after})
-    load_matrix_from_disk.clear()
-
-def published_only(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if "status" not in df.columns:
-        return df
-    return df[df["status"].astype(str).str.upper() == "PUBLISHED"].copy()
-
-def pick_active_published(marketplace: str, kind: str, when: dt.date) -> Optional[Dict[str, Any]]:
-    """
-    Devuelve la versión PUBLISHED vigente en 'when' (si hay varias, toma la más nueva).
-    Regla dura: SOLO PUBLISHED.
-    """
-    inv = list_matrices(marketplace)
-    if inv is None or inv.empty:
-        return None
-    if "kind" in inv.columns:
-        inv = inv[inv["kind"].astype(str).str.upper() == str(kind).upper()].copy()
-    inv = published_only(inv)
-    if inv.empty:
-        return None
-    when_ts = pd.to_datetime(when)
-    inv["vf"] = pd.to_datetime(inv.get("valid_from"), errors="coerce")
-    inv["vt"] = pd.to_datetime(inv.get("valid_to"), errors="coerce")
-    inv = inv[(inv["vf"] <= when_ts) & ((inv["vt"].isna()) | (inv["vt"] >= when_ts))].copy()
-    if inv.empty:
-        return None
-    inv = inv.sort_values(["vf","created_at"], ascending=[False, False])
-    return inv.iloc[0].to_dict()
-
-
-# Registry
-
-def load_registry() -> List[Dict[str, Any]]:
-    if not os.path.exists(REGISTRY_PATH):
-        return []
-    with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_registry(reg: List[Dict[str, Any]]) -> None:
-    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
-        json.dump(reg, f, ensure_ascii=False, indent=2, default=str)
-
-def ensure_registry_defaults(reg: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    changed = False
-    for e in reg:
-        # kind: RAW vs NORMALIZADA (MAX por región + tramo)
-        if "kind" not in e:
-            e["kind"] = "RAW"  # compat: versiones viejas
-            changed = True
-        if "status" not in e:
-            e["status"] = "DRAFT"; changed = True
-        if "actor" not in e:
-            e["actor"] = "unknown"; changed = True
-        if "updated_at" not in e:
-            e["updated_at"] = e.get("created_at"); changed = True
-        if "meta" not in e or e["meta"] is None:
-            e["meta"] = {}; changed = True
-    if changed:
-        save_registry(reg)
-    return reg
-
-def matrix_file_path(name: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", name)
-    return os.path.join(DATA_DIR, f"{safe}.pkl")
-
-def save_matrix_to_disk(name: str, df_norm: pd.DataFrame) -> str:
-    path = matrix_file_path(name)
-    df_norm.to_pickle(path)
-    return path
-
-@st.cache_data(show_spinner=False)
-def load_matrix_from_disk(path: str) -> pd.DataFrame:
-    return pd.read_pickle(path)
-
-def register_matrix(
-    name: str,
-    marketplace: str,
-    valid_from: dt.date,
-    valid_to: Optional[dt.date],
-    df_norm: pd.DataFrame,
-    actor: str,
-    status: str,
-    kind: str,
-    meta: Dict[str, Any],
-) -> None:
-    reg = ensure_registry_defaults(load_registry())
-    created_at = iso_now()
-    path = save_matrix_to_disk(name, df_norm)
-    reg.append({
-        "name": name,
-        "marketplace": marketplace,
-        "kind": str(kind).strip().upper(),
-        "valid_from": valid_from.isoformat(),
-        "valid_to": valid_to.isoformat() if valid_to else None,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "path": path,
-        "status": status,
-        "actor": actor,
-        "meta": meta or {},
-    })
-    save_registry(reg)
-    load_matrix_from_disk.clear()
-    audit_log("matrix_create", actor, {"name": name, "status": status, "kind": str(kind).strip().upper()})
-
-def list_matrices(marketplace: Optional[str]=None) -> pd.DataFrame:
-    reg = ensure_registry_defaults(load_registry())
-    df = pd.DataFrame(reg)
-    if df.empty:
-        return df
-    if marketplace is not None:
-        df = df[df["marketplace"] == marketplace].copy()
-    return df.sort_values(["marketplace","valid_from","created_at"], ascending=[True, True, False])
-
-# -----------------------------
-# UI helpers
-# -----------------------------
-def dataset_panel(title: str, df: Optional[pd.DataFrame], label: str, path: str) -> None:
-    st.markdown(f"### Dataset actual: {title}")
-    if df is None:
-        st.info("No hay datos cargados todavía.")
-        return
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Filas", len(df))
-    if "guia" in df.columns:
-        c2.metric("Guías únicas", int(df["guia"].nunique()))
-    elif "sku" in df.columns:
-        c2.metric("SKUs", int(df["sku"].nunique()))
-    else:
-        c2.metric("Columnas", len(df.columns))
-    c3.metric("Última modificación", dt.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds") if (os.path.exists(path) and os.path.isfile(path)) else "")
-    c4.metric("Backups", len([f for f in os.listdir(BACKUP_DIR) if f.startswith(label + "_")]))
-    st.dataframe(df, use_container_width=True, height=520)
-    st.download_button("Descargar dataset actual (CSV)", df.to_csv(index=False).encode("utf-8"), f"{label}_actual.csv", "text/csv")
-    st.download_button("Descargar dataset actual (Excel)", to_excel_bytes(df, sheet=label), f"{label}_actual.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    colx,coly,colz = st.columns(3)
-    with colx:
-        if st.button(f"Borrar {title}", type="secondary"):
-            backup_file(path, label)
-            delete_file(path)
-            audit_log(f"{label}_delete", actor, {})
-            st.success("Borrado (backup creado). Recargá la página.")
-    with coly:
-        if st.button("Restaurar último backup"):
-            ok = restore_backup(label, path)
-            st.success("Restaurado. Recargá la página.") if ok else st.warning("No hay backups disponibles.")
-    with colz:
-        st.caption("Consejo: siempre simulá primero y recién después aplicá.")
-
-def change_plan(old: Optional[pd.DataFrame], new: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
-    """
-    Plan de cambios simple:
-      - filas nuevas vs filas que desaparecerían, usando key_cols (si existen).
-    """
-    if old is None:
-        return pd.DataFrame([{"tipo":"nuevo_dataset","detalle":f"Se cargan {len(new):,} filas (no existía dataset previo)."}])
-    for k in key_cols:
-        if k not in old.columns or k not in new.columns:
-            return pd.DataFrame([{"tipo":"reemplazo_total","detalle":"Se reemplaza dataset completo (no se pudieron comparar keys)."}])
-
-    old_keys = set(tuple(x) for x in old[key_cols].astype(str).values.tolist())
-    new_keys = set(tuple(x) for x in new[key_cols].astype(str).values.tolist())
-    add = len(new_keys - old_keys)
-    rem = len(old_keys - new_keys)
-    return pd.DataFrame([
-        {"tipo":"reemplazo_total","detalle":f"Dataset actual: {len(old):,} filas. Nuevo: {len(new):,} filas."},
-        {"tipo":"keys_nuevas", "detalle": f"Keys nuevas detectadas: {add:,} (sobre {len(new_keys):,} keys del nuevo)."},
-        {"tipo":"keys_que_se_pierden", "detalle": f"Keys que desaparecerían: {rem:,} (sobre {len(old_keys):,} keys del actual)."},
-    ])
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="Andreani | Gestión logística (v1.53)", layout="wide")
-st.title("Andreani | Gestión logística (v1.53) — Modo simulación")
-
-with st.sidebar:
-    st.header("Operación")
-    actor = st.text_input("Operador", value="Fede")
-
-    st.divider()
-    st.header("Plantillas (descarga)")
-    st.download_button("Config YAML (plantilla)", file_bytes(TPL_CONFIG), "config.yaml")
-    st.download_button("CP Master (plantilla)", file_bytes(TPL_CP), "template_cp_master.xlsx")
-    st.download_button("Catálogo (plantilla)", file_bytes(TPL_CATALOG), "template_catalogo.xlsx")
-    st.download_button("Ventas (plantilla)", file_bytes(TPL_SALES), "template_ventas.xlsx")
-    st.download_button("Matriz Andreani (Region ME1) (plantilla)", file_bytes(TPL_AND), "template_matriz_andreani.xlsx")
-    st.download_button("Matriz ME1 (plantilla)", file_bytes(TPL_ME1), "template_matriz_me1.xlsx")
-    st.download_button("Matriz BNA (plantilla)", file_bytes(TPL_BNA), "template_matriz_bna.xlsx")
-    st.download_button("Free shipping CPs (plantilla)", file_bytes(TPL_FREE), "template_free_shipping_cps.xlsx")
-
-    st.divider()
-    page = st.radio("Módulos", ["Home", "CP Master", "Catálogo", "Ventas", "Matriz Andreani (madre)", "Auditor Facturas", "Audit Trail"], index=0)
-    st.caption("Tip: Matrices → publicá (PUBLISHED) para que se usen en cálculos.")
-
-    st.divider()
-    cfg_file = st.file_uploader("Config YAML (opcional)", type=["yml","yaml"])
-    st.caption("Tip: por default, TODO se puede simular sin escribir nada.")
-
-config = load_config(cfg_file)
-
-cp_master = get_cp_master()
-catalog = get_catalog()
-sales = get_sales()
-reg_all = list_matrices(None)
-
-# HOME
-if page == "Home":
-    st.subheader("Estado / Memoria")
-    st.info("Regla dura: la app SOLO usa matrices con estado PUBLISHED para cálculos. DRAFT es borrador.")
-    st.dataframe(memory_status(), use_container_width=True, height=280)
-
-    st.markdown("### Visualización completa (datasets actuales)")
-    with st.expander("Ver CP Master", expanded=False):
-        if cp_master is None:
-            st.info("Sin CP Master.")
-        else:
-            st.dataframe(cp_master, use_container_width=True, height=520)
-    with st.expander("Ver Catálogo", expanded=False):
-        if catalog is None:
-            st.info("Sin catálogo.")
-        else:
-            st.dataframe(catalog, use_container_width=True, height=520)
-    with st.expander("Ver Ventas", expanded=False):
-        if sales is None:
-            st.info("Sin ventas.")
-        else:
-            st.dataframe(sales, use_container_width=True, height=520)
-
-# CP MASTER
-if page == "CP Master":
-    st.subheader("CP Master — Simular / Aplicar")
-
-    st.caption("Tip: si tu archivo trae CP con separadores (ej. 1,071), la app lo normaliza a 1071 para el matching.")
-    dataset_panel("CP Master", cp_master, "cp_master", CP_MASTER_PATH)
-
-    st.markdown("### Edición manual de CP Master (pro)")
-    st.caption("Acá podés ajustar/crear filas y asignar **region** con selector (evita regiones inválidas).")
-
-    REGION_OPTIONS = ["LOCAL", "INTERIOR I", "INTERIOR II", "PATAGONIA I", "PATAGONIA II", "TIERRA DEL FUEGO"]
-
-    if cp_master is None or getattr(cp_master, "empty", True):
-        st.info("No hay CP Master cargado para editar.")
-    else:
-        editor_src = cp_master.copy()
-
-        # Si el archivo no trae región, la calculamos como base (igual podés editarla).
-        if "region" not in editor_src.columns:
-            try:
-                editor_src["region"] = editor_src.apply(lambda r: region_from_cp(r.get("CP", r.get("CP_int")), cp_master)[0], axis=1)
-            except Exception:
-                editor_src["region"] = None
-
-        # Solo lo que se edita a mano
-        cols_edit = [c for c in ["CP", "Provincia", "Localidad", "region"] if c in editor_src.columns]
-        editor_view = editor_src[cols_edit].copy()
-
-        edited_cp = st.data_editor(
-            editor_view,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "region": st.column_config.SelectboxColumn("region", options=REGION_OPTIONS, required=True),
-            },
-        )
-
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            if st.button("Guardar edición de CP Master", type="primary"):
-                try:
-                    norm = normalize_cp_master(edited_cp)
-                    set_cp_master(norm)
-                    st.success("CP Master actualizado.")
-                except Exception as e:
-                    st.error(f"No pude guardar el CP Master: {e}")
-
-        with c2:
-            tpl = pd.DataFrame(columns=["CP", "Provincia", "Localidad", "region"])
-            st.download_button(
-                "Descargar plantilla CP Master (con región)",
-                data=tpl.to_csv(index=False).encode("utf-8"),
-                file_name="template_cp_master_region.csv",
-                mime="text/csv",
+        for bc in band_cols:
+            b = parse_weight_band(bc)
+            if not b:
+                continue
+            w1, w2 = b
+            cost = pd.to_numeric(r.get(bc), errors="coerce")
+            if pd.isna(cost):
+                continue
+            rows.append(
+                {
+                    "region_key": region_key,
+                    "w_from": float(w1),
+                    "w_to": float(w2),
+                    "cost": float(cost),
+                    "exc_per_kg": None if pd.isna(exc) else float(exc),
+                }
             )
 
-    st.divider()
-    st.markdown("### Import (preview + validación)")
-    up = st.file_uploader("Subir CP.xlsx", type=["xlsx"])
-    if up is not None:
-        try:
-            df_raw = read_excel_safe(up, converters={"CP": str, "Provincia": str, "Localidad": str})
-            df_preview, warns = normalize_cp_master(df_raw)
-            st.success("Validación OK.")
-            for w in warns: st.warning(w)
-            st.dataframe(df_preview.head(200), use_container_width=True, height=520)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError("Matriz Andreani: quedó vacía al normalizar.")
 
-            st.markdown("#### Plan de cambios")
-            st.dataframe(change_plan(cp_master, df_preview, key_cols=["CP_int"]), use_container_width=True)
+    meta = {
+        "regions": sorted(out["region_key"].dropna().unique().tolist()),
+        "bands": sorted({(a, b) for a, b in zip(out["w_from"], out["w_to"])}),
+        "band_cols": band_cols,
+    }
+    return out.reset_index(drop=True), meta
 
-            st.download_button("Descargar preview normalizado (Excel)", to_excel_bytes(df_preview, "cp_master_preview"),
-                               "cp_master_preview.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("Descargar preview normalizado (CSV)", df_preview.to_csv(index=False).encode("utf-8"),
-                               "cp_master_preview.csv", "text/csv")
 
-            col1,col2 = st.columns(2)
-            with col1:
-                st.button("Simular (no guarda)", disabled=True, help="Ya estás simulando: el preview NO se guarda.")
-            with col2:
-                confirm = st.checkbox("Confirmo que el preview está OK y quiero aplicar (sobrescribe).", key="cp_confirm")
-                if st.button("Aplicar cambios", type="primary", disabled=not confirm):
-                    backup_file(CP_MASTER_PATH, "cp_master")
-                    set_cp_master(df_preview)
-                    audit_log("cp_master_set", actor, {"rows": int(len(df_preview))})
-                    st.success("Aplicado. Recargá la página.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+def tariff_lookup(matrix_long: pd.DataFrame, *, region_key: str, kg: float) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Devuelve:
+      (expected_cost, exc_used, status)
+    - Si kg cae dentro de una banda: cost
+    - Si kg excede el máximo w_to: cost(max_band) + exc_per_kg*(kg - w_to_max) si existe exc
+    - Si no hay region: status SIN_REGION_EN_MATRIZ
+    """
+    if not region_key:
+        return None, None, "SIN_REGION"
 
-# CATÁLOGO
-if page == "Catálogo":
-    st.subheader("Catálogo — Simular / Aplicar")
-    dataset_panel("Catálogo", catalog, "catalog", CATALOG_PATH)
+    m = matrix_long[matrix_long["region_key"] == region_key].copy()
+    if m.empty:
+        return None, None, "SIN_REGION_EN_MATRIZ"
 
-    st.divider()
-    st.markdown("### Import (preview + validación)")
-    up = st.file_uploader("Subir catálogo (xlsx/csv)", type=["xlsx","csv"])
-    if up is not None:
-        try:
-            if up.name.lower().endswith(".csv"):
-                df_raw = pd.read_csv(up)
-            else:
-                df_raw = read_excel_safe(up, converters={"sku": str, "producto": str})
-            df_preview, warns = normalize_catalog(df_raw)
-            st.success("Validación OK.")
-            for w in warns: st.warning(w)
-            st.dataframe(df_preview.head(300), use_container_width=True, height=520)
+    kg = float(kg)
+    # dentro de banda (inclusive)
+    inside = m[(m["w_from"] <= kg) & (kg <= m["w_to"])]
+    if not inside.empty:
+        # si hubiera duplicados, tomamos el mínimo costo (conservador)
+        row = inside.sort_values(["w_from", "w_to", "cost"], ascending=[True, True, True]).iloc[0]
+        return float(row["cost"]), None, "OK"
 
-            st.markdown("#### Plan de cambios")
-            st.dataframe(change_plan(catalog, df_preview, key_cols=["sku"]), use_container_width=True)
+    # si supera máximo: aplicar excedente
+    max_row = m.sort_values(["w_to", "w_from"], ascending=[False, False]).iloc[0]
+    w_to = float(max_row["w_to"])
+    base_cost = float(max_row["cost"])
+    exc = max_row["exc_per_kg"]
+    if kg > w_to:
+        if exc is None or (isinstance(exc, float) and math.isnan(exc)):
+            return None, None, "SIN_BANDA_SIN_EXC"
+        extra = float(exc) * (kg - w_to)
+        return base_cost + extra, float(exc), "OK_EXCEDENTE"
 
-            st.download_button("Descargar preview normalizado (Excel)", to_excel_bytes(df_preview, "catalog_preview"),
-                               "catalog_preview.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("Descargar preview normalizado (CSV)", df_preview.to_csv(index=False).encode("utf-8"),
-                               "catalog_preview.csv", "text/csv")
+    # si queda por debajo del mínimo: tomar la mínima banda
+    min_row = m.sort_values(["w_from", "w_to"], ascending=[True, True]).iloc[0]
+    return float(min_row["cost"]), None, "OK_UNDER_MIN"
 
-            col1,col2 = st.columns(2)
-            with col1:
-                st.button("Simular (no guarda)", disabled=True, help="Ya estás simulando: el preview NO se guarda.")
-            with col2:
-                confirm = st.checkbox("Confirmo que el preview está OK y quiero aplicar (sobrescribe).", key="cat_confirm")
-                if st.button("Aplicar cambios", type="primary", disabled=not confirm):
-                    backup_file(CATALOG_PATH, "catalog")
-                    set_catalog(df_preview)
-                    audit_log("catalog_set", actor, {"rows": int(len(df_preview))})
-                    st.success("Aplicado. Recargá la página.")
-        except Exception as e:
-            st.error(f"Error: {e}")
 
-# VENTAS
-if page == "Ventas":
-    st.subheader("Ventas — Simular / Aplicar (visualización completa)")
-    dataset_panel("Ventas", sales, "sales", SALES_PATH)
+# =========================
+# Matrices Registry (simple)
+# =========================
+def load_registry() -> Dict[str, Any]:
+    if not os.path.exists(REGISTRY_PATH):
+        return {"matrices": []}
 
-    st.divider()
-    st.markdown("### Import (preview + validación + sanity-check)")
-    up = st.file_uploader("Subir ventas (xlsx/csv)", type=["xlsx","csv"])
-    if up is not None:
-        try:
-            if up.name.lower().endswith(".csv"):
-                df_raw = pd.read_csv(up)
-            else:
-                df_raw = read_excel_safe(up, converters={"guia": str, "cp": str, "sku": str})
-            df_preview, warns = normalize_sales(df_raw)
+    try:
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-            cross_warns = []
-            cat = get_catalog()
-            if cat is None:
-                cross_warns.append("No hay catálogo cargado: no puedo validar SKUs faltantes todavía.")
-            else:
-                missing_skus = sorted(set(df_preview["sku"]) - set(cat["sku"].astype(str)))
-                if missing_skus:
-                    cross_warns.append(f"Hay {len(missing_skus)} SKUs en ventas que NO existen en catálogo (ej: {missing_skus[:8]}).")
+        # Formato legacy: lista directa
+        if isinstance(data, list):
+            return {"matrices": data}
 
-            st.success("Validación OK.")
-            for w in warns: st.warning(w)
-            for w in cross_warns: st.warning(w)
+        # Formato nuevo: dict con key matrices
+        if isinstance(data, dict):
+            mats = data.get("matrices", [])
+            return {"matrices": mats if isinstance(mats, list) else []}
 
-            st.markdown("#### Sanity-check")
-            st.json(sales_sanity(df_preview))
+        return {"matrices": []}
 
-            st.markdown("#### Preview normalizado")
-            st.dataframe(df_preview.head(400), use_container_width=True, height=560)
+    except Exception:
+        return {"matrices": []}
 
-            st.markdown("#### Plan de cambios")
-            st.dataframe(change_plan(sales, df_preview, key_cols=["guia","sku","fecha_envio"]), use_container_width=True)
+def save_registry(reg: Dict[str, Any]) -> None:
+    mats = reg.get("matrices", [])
+    if not isinstance(mats, list):
+        mats = []
+    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"matrices": mats}, f, ensure_ascii=False, indent=2)
 
-            st.download_button("Descargar preview normalizado (Excel)", to_excel_bytes(df_preview, "sales_preview"),
-                               "sales_preview.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.download_button("Descargar preview normalizado (CSV)", df_preview.to_csv(index=False).encode("utf-8"),
-                               "sales_preview.csv", "text/csv")
+def _normalize_registry_entry(e: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(e, dict):
+        return {}
 
-            col1,col2 = st.columns(2)
-            with col1:
-                st.button("Simular (no guarda)", disabled=True, help="Ya estás simulando: el preview NO se guarda.")
-            with col2:
-                confirm = st.checkbox("Confirmo que el preview está OK y quiero aplicar (sobrescribe).", key="sales_confirm")
-                if st.button("Aplicar cambios", type="primary", disabled=not confirm):
-                    backup_file(SALES_PATH, "sales")
-                    set_sales(df_preview)
-                    audit_log("sales_set", actor, {"rows": int(len(df_preview)), "guides": int(df_preview['guia'].nunique())})
-                    st.success("Aplicado. Recargá la página.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+    out = dict(e)
 
-# MATRIZ
+    # path legacy -> file_path
+    if "file_path" not in out and "path" in out:
+        out["file_path"] = out["path"]
 
-if page == "Matriz Andreani (madre)":
-    st.subheader("Matriz Andreani (madre) — RAW vs NORMALIZADA (MAX)")
-    st.caption("Acá elegís QUÉ estás cargando y la app lo guarda en el espacio correcto.")
+    out["name"] = str(out.get("name", "")).strip()
+    out["status"] = str(out.get("status", "")).strip().upper()
 
-    tipo = st.radio(
-        "Tipo de matriz a registrar",
-        ["RAW (original Andreani)", "NORMALIZADA (MAX por región + tramo de peso)"],
-        index=0,
-        help=(
-            "RAW: se usa para auditoría de facturas (más fiel al universo de tarifas posibles).\n"
-            "NORMALIZADA: se usa para emitir matrices de marketplaces (una sola tarifa por región y tramo)."
+    # marketplace real
+    mp = out.get("marketplace", "")
+    out["marketplace"] = str(mp).strip().lower()
+
+    # kind real (RAW / NORMALIZADA)
+    out["kind"] = str(out.get("kind", "")).strip().upper()
+
+    out["updated_at"] = out.get("updated_at") or out.get("created_at") or ""
+
+    # normalizar path (Windows)
+    fp = out.get("file_path")
+    if fp:
+        fp = os.path.normpath(fp)
+        if not os.path.isabs(fp):
+            fp = os.path.normpath(os.path.join(APP_DIR, fp))
+        out["file_path"] = fp
+
+    return out
+
+
+def upsert_matrix_version(
+    *,
+    name: str,
+    kind: str,          # en tu esquema: "RAW" o "NORMALIZADA"
+    status: str,        # "DRAFT" / "PUBLISHED"
+    valid_from: Optional[str],
+    valid_to: Optional[str],
+    file_path: str,
+    meta: Dict[str, Any],
+    marketplace: str = "andreani",
+) -> None:
+    reg = load_registry()
+    rows = reg.get("matrices", [])
+    if not isinstance(rows, list):
+        rows = []
+
+    name = str(name).strip()
+    kind = str(kind).strip().upper()
+    status = str(status).strip().upper()
+    marketplace = str(marketplace).strip().lower()
+
+    # reemplaza por misma combinación marketplace + kind + name
+    def _same(r: Any) -> bool:
+        if not isinstance(r, dict):
+            return False
+        r_name = str(r.get("name", "")).strip()
+        r_kind = str(r.get("kind", "")).strip().upper()
+        r_mp = str(r.get("marketplace", r.get("mp", ""))).strip().lower()
+        return (r_name == name) and (r_kind == kind) and (r_mp == marketplace)
+
+    rows = [r for r in rows if not _same(r)]
+
+    entry = {
+        "name": name,
+        "marketplace": marketplace,      # 👈 tu esquema real
+        "kind": kind,                    # 👈 "RAW" / "NORMALIZADA"
+        "status": status,                # 👈 "PUBLISHED" / "DRAFT"
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "path": file_path,               # 👈 legacy (tu archivo actual)
+        "file_path": file_path,          # 👈 nuevo (compatible con el refactor)
+        "meta": meta or {},
+        "updated_at": iso_now(),
+        "created_at": iso_now(),
+    }
+
+    rows.append(entry)
+
+    # orden estable
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            str(r.get("marketplace", "")),
+            str(r.get("kind", "")),
+            str(r.get("name", "")),
         ),
     )
 
-    up = st.file_uploader("Subir matriz (xlsx)", type=["xlsx"])
-    name_default = f"andreani_{today().isoformat()}_{'RAW' if tipo.startswith('RAW') else 'NORM'}"
-    name = st.text_input("Nombre versión", value=name_default)
-    valid_from = st.date_input("Vigente desde", value=today())
-    has_end = st.checkbox("Tiene fecha de fin", value=True)
-    valid_to = st.date_input("Vigente hasta", value=today().replace(day=28)) if has_end else None
-    notes = st.text_area("Notas", placeholder="Ej: Vigente Ago-2025 a Nov-2025. Sin IVA / sin SGD.")
-    status = st.selectbox("Estado", ["DRAFT","PUBLISHED"], index=0)
+    reg["matrices"] = rows
+    save_registry(reg)
 
-    st.divider()
-    st.markdown("### Simulación (preview + validación)")
 
-    if up is None:
-        st.info("Subí un archivo para ver el preview y validar antes de registrar.")
-    else:
+def pick_active_matrix(marketplace: str, ref_date: dt.date) -> Optional[Dict[str, Any]]:
+    reg = load_registry()
+    raw = reg.get("matrices", [])
+    mats = [_normalize_registry_entry(x) for x in raw]
+    mats = [m for m in mats if m]
+
+    marketplace = str(marketplace).strip().lower()
+
+    def _parse(d: Optional[str]) -> Optional[dt.date]:
+        if not d:
+            return None
         try:
-            df_raw = read_excel_safe(up)
+            return dt.datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            return None
 
-            # 1) Parse Andreani al formato de cálculo (con tier_id + tramos)
-            matrix_type, norm_raw, meta_extra = normalize_tariffs_any(df_raw)
+    candidates = []
+    for m in mats:
+        if m.get("status") != "PUBLISHED":
+            continue
+        if m.get("marketplace") != marketplace:
+            continue
+        if m.get("kind") != "RAW":
+            continue
 
-            if matrix_type != "andreani_region":
-                st.error("Este módulo está pensado para la matriz Andreani en formato 'Region ME1' con tramos tipo '0-50'.")
-                st.stop()
+        vf = _parse(m.get("valid_from"))
+        vt = _parse(m.get("valid_to"))
+        if vf and ref_date < vf:
+            continue
+        if vt and ref_date > vt:
+            continue
 
-            # 2) Si es NORMALIZADA: consolidar por región + tramo de peso (ignorando tier_id)
-            if tipo.startswith("NORMALIZADA"):
-                # MAX costo y MAX exc por (región, w_from, w_to)
-                norm = (
-                    norm_raw
-                    .groupby(["region","w_from","w_to"], as_index=False)
-                    .agg({"cost":"max", "exc_per_kg":"max"})
-                    .sort_values(["region","w_from","w_to"])
-                    .reset_index(drop=True)
-                )
-                kind = "NORMALIZADA"
-                st.success("Se generó la matriz NORMALIZADA usando MAX por región + tramo de peso.")
-            else:
-                # RAW: mantener el detalle con tier_id
-                norm = norm_raw.copy()
-                kind = "RAW"
-                st.success("Se usará la matriz RAW (detalle por tier_id).")
+        fp = m.get("file_path")
+        if not fp or not os.path.exists(fp):
+            continue
 
-            # Rounding
-            if "cost" in norm.columns:
-                norm["cost"] = norm["cost"].apply(lambda v: apply_rounding(config, v))
+        candidates.append(m)
 
-            # Validación
-            rep = validate_matrix("andreani_region", norm if kind=="RAW" else norm.rename(columns={"w_from":"w_from","w_to":"w_to"}))
-            if rep["errors"]:
-                st.error("Errores: no se puede registrar.")
-            st.json(rep)
+    if not candidates:
+        return None
 
-            # Métricas de limpieza
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Filas RAW parseadas", int(len(norm_raw)))
-            c2.metric("Filas a registrar", int(len(norm)))
-            c3.metric("Reducción", f"{(1 - (len(norm)/max(1,len(norm_raw))))*100:.1f}%")
+    candidates.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return candidates[0]
 
-            st.markdown("#### Preview")
-            st.caption("Nota: `tier_id` es un ID técnico (orden de fila en el Excel). No representa bultos reales del envío.")
-            st.dataframe(norm.head(500), use_container_width=True, height=560)
 
-            # Export del preview
-            st.download_button(
-                "Descargar preview normalizado (Excel)",
-                to_excel_bytes(norm, "preview"),
-                f"{name.strip()}_preview.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+# =========================
+# PDF Auditor (Andreani)
+# =========================
+RE_SERV = re.compile(
+    r"^Servicio de transporte\s+(?P<svc>[A-Z]{3,4})\s+\d+\s+(?P<remito>[^ ]+)\s+(?P<fecha>\d{2}\.\d{2}\.\d{4})\s+(?P<bultos>\d+)\s+(?P<kg>[0-9\.,]+)\s+(?P<cant>[0-9\.,]+)\s+(?P<desc>[0-9\.,]+)\s+(?P<neto>[0-9\.,]+)\s*$"
+)
+RE_ENVIO = re.compile(r"Nro\.?\s*de\s*Envío:\s*(\d{10,})", re.IGNORECASE)
 
-            # Aplicar (registrar)
-            st.divider()
-            st.markdown("### Registrar versión (escritura)")
-            confirm = st.checkbox("Confirmo que el preview está OK y quiero registrar esta versión.", key="mat_confirm")
-            if st.button("Registrar versión", type="primary", disabled=(len(rep["errors"])>0 or not confirm)):
-                meta = {
-                    "notes": notes,
-                    "validation": rep,
-                    "matrix_type": "andreani_region",
-                    "kind_policy": "RAW=detalle por tier_id | NORMALIZADA=MAX por región+tramo",
-                    **(meta_extra or {}),
-                }
-                register_matrix(
-                    name=name.strip(),
-                    marketplace="andreani",
-                    valid_from=valid_from,
-                    valid_to=valid_to if has_end else None,
-                    df_norm=norm,
-                    actor=actor,
-                    status=status,
-                    kind=kind,
-                    meta=meta,
-                )
-                st.success(f"Versión registrada como {kind}.")
-        except Exception as e:
-            st.error(f"Error: {e}")
 
-    st.divider()
-    st.markdown("### Inventario — Andreani (diferenciado)")
-    inv = list_matrices("andreani")
-    if inv.empty:
-        st.info("No hay matrices Andreani registradas todavía.")
-    else:
-        # Asegurar columna kind en viejas
-        if "kind" not in inv.columns:
-            inv["kind"] = "RAW"
-        colA, colB = st.columns(2)
-        with colA:
-            st.markdown("#### RAW (para auditoría)")
-            inv_raw = inv[inv["kind"].astype(str).str.upper() == "RAW"].copy()
-            st.dataframe(inv_raw[["name","status","valid_from","valid_to","created_at","actor"]], use_container_width=True, height=260)
-        with colB:
-            st.markdown("#### NORMALIZADA (para emitir matrices)")
-            inv_norm = inv[inv["kind"].astype(str).str.upper() == "NORMALIZADA"].copy()
-            st.dataframe(inv_norm[["name","status","valid_from","valid_to","created_at","actor"]], use_container_width=True, height=260)
+def parse_pdf_shipments(pdf_bytes: bytes) -> pd.DataFrame:
+    """Extrae por guía: fecha_factura, bultos, kg, disd, sgd."""
+    rows: List[Dict[str, Any]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        lines: List[str] = []
+        for p in pdf.pages:
+            t = p.extract_text() or ""
+            lines += t.splitlines()
 
-        st.markdown("#### Ver una versión")
-        sel = st.selectbox("Seleccionar versión", inv["name"].tolist())
-        row = inv[inv["name"] == sel].iloc[0].to_dict()
-        dfm = load_matrix_from_disk(row["path"])
-        st.caption(f"Tipo: {row.get('kind','')} | Vigencia: {row.get('valid_from','')} → {row.get('valid_to') or 'sin fin'} | Estado: {row.get('status')}")
-        st.dataframe(dfm.head(500), use_container_width=True, height=520)
+    cur = {"disd": None, "sgd": None, "bultos": None, "kg": None, "fecha": None}
 
-        st.divider()
-        st.markdown("### Acciones por versión (gobernanza)")
-        st.caption("Regla dura: la app SOLO usa matrices **PUBLISHED** para cálculos. DRAFT es borrador.")
+    for l in lines:
+        l = (l or "").strip()
+        m = RE_SERV.match(l)
+        if m:
+            svc = m.group("svc").upper()
+            fecha = dt.datetime.strptime(m.group("fecha"), "%d.%m.%Y").date()
+            bultos = int(m.group("bultos"))
+            kg = ar_money_to_float(m.group("kg"))
+            neto = ar_money_to_float(m.group("neto"))
+            cur["bultos"] = bultos
+            cur["kg"] = kg
+            cur["fecha"] = fecha
+            if svc == "DISD":
+                cur["disd"] = neto
+            elif svc == "SGD":
+                cur["sgd"] = neto
+            continue
 
-        action_name = st.selectbox("Elegir versión para administrar", inv["name"].tolist(), key="admin_sel")
-        row2 = inv[inv["name"] == action_name].iloc[0].to_dict()
-
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Tipo", row2.get("kind",""))
-        cB.metric("Estado", row2.get("status",""))
-        cC.metric("Desde", row2.get("valid_from",""))
-        cD.metric("Hasta", row2.get("valid_to") or "sin fin")
-
-        st.divider()
-        st.markdown("#### Renombrar versión")
-        st.caption("Cambia el nombre de la versión (y si se puede, renombra el archivo en disco). No modifica tarifas.")
-        with st.form("rename_form"):
-            new_name = st.text_input("Nuevo nombre", value=str(action_name))
-            do_rename = st.form_submit_button("Renombrar")
-            if do_rename:
-                try:
-                    rename_matrix_version(action_name, new_name.strip(), actor)
-                    st.success("Nombre actualizado.")
-                except Exception as e:
-                    st.error(f"No se pudo renombrar: {e}")
-
-        desired_pub = st.toggle("PUBLISHED (oficial)", value=str(row2.get("status","")).upper()=="PUBLISHED")
-        if desired_pub and str(row2.get("status","")).upper() != "PUBLISHED":
-            if st.button("Publicar versión", type="primary"):
-                update_matrix_entry(action_name, actor, {"status":"PUBLISHED"})
-                st.success("Publicada. (Queda oficial para cálculos)")
-        if (not desired_pub) and str(row2.get("status","")).upper() == "PUBLISHED":
-            if st.button("Pasar a DRAFT (despublicar)", type="secondary"):
-                update_matrix_entry(action_name, actor, {"status":"DRAFT"})
-                st.warning("Despublicada. (No se usa para cálculos)")
-
-        st.divider()
-        
-        st.markdown("#### Editar vigencia + notas")
-
-        # OJO: el checkbox fuera del form permite que aparezca/desaparezca el campo "Vigente hasta"
-        # sin tener que apretar "Guardar" primero (Streamlit forms no re-ejecutan en cada cambio).
-        _ver_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(action_name))
-
-        _vf0 = pd.to_datetime(row2.get("valid_from"), errors="coerce")
-        vf_default = (_vf0.date() if not pd.isna(_vf0) else today())
-
-        has_end2 = st.checkbox(
-            "Tiene fecha de fin",
-            value=row2.get("valid_to") is not None,
-            key=f"meta_has_end_{_ver_key}",
-        )
-
-        with st.form(f"edit_meta_form_{_ver_key}"):
-            vf = st.date_input("Vigente desde", value=vf_default, key=f"meta_vf_{_ver_key}")
-
-            vt = None
-            if has_end2:
-                _vt0 = pd.to_datetime(row2.get("valid_to"), errors="coerce")
-                vt_default = (_vt0.date() if not pd.isna(_vt0) else vf_default)
-                vt = st.date_input("Vigente hasta", value=vt_default, key=f"meta_vt_{_ver_key}")
-
-            notes2 = st.text_area(
-                "Notas",
-                value=str(row2.get("notes") or ""),
-                placeholder="Ej: ajuste por actualización tarifaria / referencia / uplift / etc.",
-                height=120,
-                key=f"meta_notes_{_ver_key}",
-            )
-            submit_meta = st.form_submit_button("Guardar cambios de metadata")
-
-        if submit_meta:
-            update_matrix_entry(
-                action_name,
-                actor,
+        m2 = RE_ENVIO.search(l)
+        if m2:
+            guia = normalize_guia(m2.group(1))
+            rows.append(
                 {
-                    "valid_from": vf,
-                    "valid_to": vt,
-                    "notes": notes2,
-                },
+                    "guia": guia,
+                    "fecha_factura": cur["fecha"],
+                    "bultos_factura": cur["bultos"],
+                    "kg_factura": cur["kg"],
+                    "disd_factura": cur["disd"],
+                    "sgd_factura": cur["sgd"],
+                }
             )
-            st.success("Metadata actualizada.")
+            cur = {"disd": None, "sgd": None, "bultos": None, "kg": None, "fecha": None}
 
-        
-        st.divider()
-        st.markdown("#### Duplicar como nueva versión (recomendado para correcciones)")
+    out = pd.DataFrame(rows)
+    out = out.dropna(subset=["guia"]).reset_index(drop=True)
+    return out
 
-        # Checkbox fuera del form para que el "Vigente hasta" aparezca en vivo
-        _ver_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(action_name))
-        nhas_end = st.checkbox("Nueva vigencia con fin", value=False, key=f"dup_has_end_{_ver_key}")
 
-        with st.form(f"dup_form_{_ver_key}"):
-            new_name = st.text_input(
-                "Nombre nueva versión",
-                value=f"{action_name} (copia)",
-                key=f"dup_name_{_ver_key}",
-            )
-            nvf = st.date_input("Vigente desde (nueva)", value=today(), key=f"dup_vf_{_ver_key}")
-            nvt = None
-            if nhas_end:
-                nvt = st.date_input("Vigente hasta (nueva)", value=today(), key=f"dup_vt_{_ver_key}")
-            nnotes = st.text_area(
-                "Notas (nueva versión)",
-                value="",
-                placeholder="Qué cambiaste y por qué (ej: corrección de tarifa / referencia / uplift).",
-                height=100,
-                key=f"dup_notes_{_ver_key}",
-            )
-            do_dup = st.form_submit_button("Crear duplicado (DRAFT)")
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Andreani | Gestión logística", layout="wide")
+st.title("Andreani | Gestión logística (v1.54) — Fix PRO")
 
-        if do_dup:
-            # Duplicamos SOLO el dataset, no pisamos el original
-            df_dup = read_pkl(action_name).copy()
-            new_entry = register_matrix(
-                marketplace="andreani",
-                kind=action_kind,
-                name=new_name,
-                status="DRAFT",
-                valid_from=nvf,
-                valid_to=nvt,
-                actor=actor,
-                notes=nnotes,
-                df=df_dup,
-            )
-            st.success("Duplicado creado.")
-
-        st.divider()
-        st.markdown("#### Eliminar (solo DRAFT)")
-        if str(row2.get("status","")).upper() == "DRAFT":
-            if st.button("Eliminar versión DRAFT", type="secondary"):
-                delete_matrix_version(action_name, actor)
-                st.success("Eliminada (y respaldada).")
-        else:
-            st.info("Solo se puede eliminar una versión en DRAFT (para no romper auditoría).")
-
-        st.divider()
-        st.markdown("### Matriz vigente hoy (SOLO PUBLISHED)")
-        kind_pick = st.selectbox("Tipo", ["RAW","NORMALIZADA"], index=0, key="vig_kind")
-        active = pick_active_published("andreani", kind_pick, today())
-        if not active:
-            st.error("No hay una matriz PUBLISHED vigente hoy para ese tipo. (Cálculo bloqueado hasta que publiques una)")
-        else:
-            st.success(f"Vigente hoy: {active['name']} ({active.get('valid_from')} → {active.get('valid_to') or 'sin fin'})")
-
-# AUDIT TRAIL
-
-if page == "Auditor Facturas":
-    st.subheader("Auditor de Facturas Andreani — PDF vs Ventas (SOLO PUBLISHED)")
-    st.caption("Objetivo: detectar tarifa inflada, peso inflado y SGD incorrecto. IVA se calcula aparte.")
-
-    # Precondiciones
-    missing = []
-    if sales is None or sales.empty:
-        missing.append("Ventas (importadas)")
-    if catalog is None or catalog.empty:
-        missing.append("Catálogo (SKU → peso_aforado_kg)")
-    if cp_master is None or cp_master.empty:
-        missing.append("CP Master (CP → provincia/localidad)")
-    if missing:
-        st.error("Faltan datasets para auditar: " + ", ".join(missing))
-        st.info("Cargalos en sus módulos y volvé.")
-        st.stop()
+with st.sidebar:
+    st.header("Navegación")
+    page = st.radio(
+        "Módulo",
+        [
+            "Estado",
+            "CP Master",
+            "Catálogo",
+            "Ventas",
+            "Matriz Andreani",
+            "Auditor Facturas",
+            "Audit Trail",
+        ],
+        index=5,
+    )
 
     st.divider()
-    st.markdown("### Selección de matriz Andreani (RAW) por fecha — automática (SOLO PUBLISHED)")
-    st.caption("No tenés que elegir una fecha a mano: la app usa la fecha de envío (Ventas) y, si falta, la fecha que viene en la factura PDF por guía.")
+    st.subheader("Config (opcional)")
+    cfg_upload = st.file_uploader("config.yaml", type=["yaml", "yml"])
+    config = load_config(cfg_upload)
 
-    # Cargamos inventario RAW publicado (para poder resolver por fecha)
-    inv_all = list_matrices("andreani")
-    inv_all = inv_all if inv_all is not None else pd.DataFrame([])
-    if (not inv_all.empty) and ("kind" in inv_all.columns):
-        inv_raw_pub = inv_all[inv_all["kind"].astype(str).str.upper()=="RAW"].copy()
-    else:
-        inv_raw_pub = inv_all.copy()
-    inv_raw_pub = published_only(inv_raw_pub)
+    st.caption("Tip: si no cargás config, se usa el config.yaml del repo o defaults.")
 
-    if inv_raw_pub.empty:
-        st.error("No hay matrices Andreani RAW en estado PUBLISHED. Publicá al menos una para auditar.")
-        st.stop()
+# Helpers de carga actual
+def get_cp_master() -> Optional[pd.DataFrame]:
+    return load_pickle(CP_MASTER_PATH) if os.path.exists(CP_MASTER_PATH) else None
 
-    inv_raw_pub["vf"] = pd.to_datetime(inv_raw_pub.get("valid_from"), errors="coerce")
-    inv_raw_pub["vt"] = pd.to_datetime(inv_raw_pub.get("valid_to"), errors="coerce")
+def get_catalog() -> Optional[pd.DataFrame]:
+    return load_pickle(CATALOG_PATH) if os.path.exists(CATALOG_PATH) else None
 
-    def matrix_for_date(d):
-        if d is None or pd.isna(d):
-            return None
-        when_ts = pd.to_datetime(d)
-        hit = inv_raw_pub[(inv_raw_pub["vf"] <= when_ts) & ((inv_raw_pub["vt"].isna()) | (inv_raw_pub["vt"] >= when_ts))].copy()
-        if hit.empty:
-            return None
-        hit = hit.sort_values(["vf","created_at"], ascending=[False, False])
-        return hit.iloc[0].to_dict()
+def get_sales() -> Optional[pd.DataFrame]:
+    return load_pickle(SALES_PATH) if os.path.exists(SALES_PATH) else None
 
-    st.info("Tip: si hay guías con fechas fuera de vigencia, el auditor las marca como 'SIN MATRIZ' y no inventa costo.")
 
-    st.divider()
-    st.markdown("### Subir factura(s) PDF (modo simulación)")
-    pdfs = st.file_uploader("Subir factura(s) Andreani (PDF)", type=["pdf"], accept_multiple_files=True)
-    # Tolerancias para flaggear diferencias (se usan SOLO en el reporte comparativo).
-    tol_ars = st.number_input(
-        "Tolerancia $ (para marcar 'sobreprecio')",
-        min_value=0.0,
-        value=1.0,
-        step=1.0,
-        format="%.2f",
-    )
-    tol_kg = st.number_input(
-        "Tolerancia KG (para marcar 'peso inflado')",
-        min_value=0.0,
-        value=0.10,
-        step=0.05,
-        format="%.2f",
-    )
+# =========================
+# Estado
+# =========================
+if page == "Estado":
+    st.subheader("Estado de datos en disco")
 
-    # Alias por compatibilidad: en versiones previas la tolerancia estaba como `tol_cost`.
-    tol_cost = tol_ars
+    rows = []
+    for label, path in [
+        ("CP master", CP_MASTER_PATH),
+        ("Catálogo", CATALOG_PATH),
+        ("Ventas", SALES_PATH),
+        ("Registry matrices", REGISTRY_PATH),
+        ("Audit trail", AUDIT_LOG_PATH),
+        ("Backups", BACKUP_DIR),
+    ]:
+        exists = os.path.exists(path)
+        size_kb = round(os.path.getsize(path) / 1024, 1) if exists and os.path.isfile(path) else 0.0
+        mod = dt.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds") if exists else ""
+        rows.append({"Recurso": label, "Ruta": path, "Existe": exists, "Tamaño (KB)": size_kb, "Modificado": mod})
 
-    # SGD config
-    base_hasta = float(config.get("sgd_base_hasta", 500000))
-    base_costo = float(config.get("sgd_base_costo", 5378))
-    exced_pct = float(config.get("sgd_excedente_pct", 0.01))
-    st.caption(f"SGD: ${base_costo:,.0f} hasta ${base_hasta:,.0f} + {exced_pct*100:.2f}% sobre excedente (configurable en YAML).")
-
-    if not pdfs:
-        st.info("Subí al menos un PDF para ver el reporte.")
-        st.stop()
-
-    # Parse PDFs
-    inv_parts = []
-    for f in pdfs:
-        try:
-            inv_parts.append(parse_invoice_pdf_bytes(f.getvalue()))
-        except Exception as e:
-            st.error(f"{f.name}: {e}")
-            with st.expander(f"Debug PDF: {f.name} (primeras líneas)", expanded=False):
-                try:
-                    import pdfplumber, io
-                    with pdfplumber.open(io.BytesIO(f.getvalue())) as _pdf:
-                        _lines=[]
-                        for _p in _pdf.pages:
-                            _t=_p.extract_text() or ""
-                            _lines.extend(_t.splitlines())
-                    st.code("\n".join(_lines[:200]))
-                except Exception as _e:
-                    st.write(_e)
-    if not inv_parts:
-        st.stop()
-
-    inv = pd.concat(inv_parts, ignore_index=True).drop_duplicates(subset=["guia"]).copy()
-    st.write(f"Envíos extraídos de PDFs: **{len(inv)}**")
-
-    # Build expected from ventas + catálogo
-    cat_map = catalog.set_index("sku")["peso_aforado_kg"].to_dict()
-
-    s = sales.copy()
-    # peso por línea
-    s["peso_linea"] = s.apply(lambda r: float(cat_map.get(r["sku"], 0.0)) * float(r["qty"]), axis=1)
-    missing_sku = s[s["peso_linea"] == 0.0]["sku"].unique().tolist()
-    if missing_sku:
-        st.warning(f"Hay SKUs sin peso en catálogo (o peso=0): {missing_sku[:15]}{'...' if len(missing_sku)>15 else ''}")
-
-    agg = (
-        s.groupby("guia", as_index=False)
-        .agg({
-            "fecha_envio": "min",
-            "cp": "first",
-            "peso_linea": "sum",
-        })
-        .rename(columns={"peso_linea":"kg_esperado"})
-    )
-
-    # Map CP -> region/prov/loc
-    agg[["region","provincia","localidad"]] = agg.apply(
-        lambda r: pd.Series(region_from_cp(r["cp"], cp_master, config)),
-        axis=1
-    )
-
-    # Merge
-    rep = inv.merge(agg, on="guia", how="left", indicator=True)
-    rep["flag_sin_venta"] = rep["_merge"] != "both"
-    rep = rep.drop(columns=["_merge"])
-
-    # Expected costs
-    # Resolver matriz por guía según fecha (prioridad: fecha_envio de Ventas; fallback: fecha_factura del PDF)
-    rep["fecha_base"] = rep["fecha_envio"]
-    rep.loc[rep["fecha_base"].isna(), "fecha_base"] = rep.loc[rep["fecha_base"].isna(), "fecha_factura"]
-
-    # Elegir versión/matriz por cada fecha única
-    rep["matrix_name"] = rep["fecha_base"].apply(lambda d: (matrix_for_date(d) or {}).get("name") if pd.notna(d) else None)
-    missing_dates = rep[rep["fecha_base"].isna()]["guia"].tolist()
-    if missing_dates:
-        st.warning(f"Hay {len(missing_dates)} guías sin fecha (ni en ventas ni en PDF). No se puede elegir tarifa para esas guías.")
-        with st.expander("Ver guías sin fecha", expanded=False):
-            st.write(missing_dates)
-
-    missing_matrix = rep[(rep["fecha_base"].notna()) & (rep["matrix_name"].isna())]
-    if not missing_matrix.empty:
-        st.error("Hay guías con fecha pero SIN matriz RAW PUBLISHED vigente. No se calcula esperado para esas guías.")
-        st.dataframe(missing_matrix[["guia","fecha_base","fecha_envio","fecha_factura"]].head(200), use_container_width=True)
-
-    # Cache: cargar cada matriz una sola vez
-    mat_cache = {}
-    for nm in sorted([x for x in rep["matrix_name"].dropna().unique().tolist()]):
-        entry = inv_raw_pub[inv_raw_pub["name"]==nm].iloc[0].to_dict()
-        mat_cache[nm] = load_matrix_from_disk(entry["path"])
-
-    # Resumen de matrices usadas
-    used = rep["matrix_name"].value_counts(dropna=False).reset_index()
-    used.columns = ["matrix_name","guias"]
-    st.caption("Matrices RAW PUBLISHED utilizadas (por fecha):")
-    st.dataframe(used, use_container_width=True, height=180)
-
-    rep["disd_esperado_max"] = rep.apply(
-        lambda r: expected_disd_from_raw(mat_cache.get(r.get("matrix_name")), r.get("region"), r.get("kg_esperado"))
-        if (r.get("matrix_name") is not None) and (not pd.isna(r.get("kg_esperado"))) else None,
-        axis=1
-    )
-    rep["delta_disd"] = (rep["disd_factura"] - rep["disd_esperado_max"])
-    rep["flag_sobreprecio_disd"] = rep["delta_disd"].apply(lambda x: False if pd.isna(x) else (x > tol_ars))
-
-    # Peso inflado: si kg_factura > kg_esperado + tol
-    rep["delta_kg"] = rep["kg_factura"] - rep["kg_esperado"]
-    rep["flag_peso_inflado"] = rep["delta_kg"].apply(lambda x: False if pd.isna(x) else (x > tol_kg))
-    rep["flag_peso_ok"] = rep["delta_kg"].apply(lambda x: False if pd.isna(x) else (x <= tol_kg))
-
-    # SGD esperado (si existe valor_declarado en ventas)
-    if "valor_declarado" in s.columns:
-        dec = s.groupby("guia", as_index=False)["valor_declarado"].sum()
-        rep = rep.merge(dec, on="guia", how="left")
-        rep["sgd_esperado"] = rep["valor_declarado"].apply(lambda v: expected_sgd(v, base_hasta, base_costo, exced_pct))
-        rep["delta_sgd"] = rep["sgd_factura"] - rep["sgd_esperado"]
-        rep["flag_sgd"] = rep["delta_sgd"].apply(lambda x: False if pd.isna(x) else (abs(x) > tol_ars))
-    else:
-        rep["valor_declarado"] = None
-        rep["sgd_esperado"] = None
-        rep["delta_sgd"] = None
-        rep["flag_sgd"] = False
-        st.info("Tip: si querés auditar SGD, agregá una columna 'valor_declarado' en Ventas (o lo hacemos como dataset aparte).")
-
-    # Prioridad de flags
-    def prio(r):
-        if r.get("flag_sin_venta"):
-            return "SIN VENTA (no matchea guía)"
-        if r.get("matrix_name") is None and (not pd.isna(r.get("fecha_base"))):
-            return "SIN MATRIZ (no hay RAW PUBLISHED vigente)"
-        if pd.isna(r.get("region")):
-            return "SIN REGIÓN (CP no mapea)"
-        if pd.isna(r.get("disd_esperado_max")):
-            return "SIN TARIFA (no se pudo matchear banda de peso en matriz)"
-        if r.get("flag_sobreprecio_disd"):
-            return "SOBREPRECIO DISD"
-        if r.get("flag_peso_inflado"):
-            return "PESO INFLADO"
-        if r.get("flag_sgd"):
-            return "SGD DIF"
-        return "OK"
-
-    rep["estado"] = rep.apply(prio, axis=1)
+    safe_show_df(pd.DataFrame(rows), label="estado")
 
     st.divider()
-    st.markdown("### Resultado")
+    st.subheader("Templates")
+    cols = st.columns(4)
+    for i, (label, p) in enumerate(
+        [
+            ("Template CP Master", TPL_CP),
+            ("Template Catálogo", TPL_CATALOG),
+            ("Template Ventas", TPL_SALES),
+            ("Template Matriz Andreani", TPL_AND),
+        ]
+    ):
+        with cols[i]:
+            if os.path.exists(p):
+                st.download_button(label, data=open(p, "rb").read(), file_name=os.path.basename(p))
+            else:
+                st.caption(f"No encontré {os.path.basename(p)} en el repo.")
+
+# =========================
+# CP Master (UI PRO: buscar + editar + incremental import)
+# =========================
+if page == "CP Master":
+    st.subheader("CP Master — Operación diaria (buscar / editar / sumar CPs)")
+
+    cur = get_cp_master()
+    if cur is None:
+        cur = pd.DataFrame(columns=["CP", "Provincia", "Localidad", "region_base", "sub_region", "region", "region_key", "CP_int"])
+
+    # --- Normalizar tipos base para editor ---
+    cur = cur.copy()
+    if "CP_int" not in cur.columns:
+        cur["CP_int"] = cur["CP"].apply(parse_cp_to_int)
+
+    # -------------------------
+    # Barra de herramientas
+    # -------------------------
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+    with c1:
+        q = st.text_input("Buscar (CP / provincia / localidad / región)", value="")
+    with c2:
+        only_missing = st.checkbox("Solo CPs sin region_key", value=False)
+    with c3:
+        only_not_found = st.checkbox("Solo CPs con datos incompletos (prov/localidad)", value=False)
+    with c4:
+        st.metric("CPs", f"{len(cur):,}")
+
+    view = cur.copy()
+
+    if q.strip():
+        nq = norm_text(q)
+        mask = (
+            view["CP"].astype(str).str.contains(q.strip(), na=False)
+            | view["Provincia"].astype(str).apply(norm_text).str.contains(nq, na=False)
+            | view["Localidad"].astype(str).apply(norm_text).str.contains(nq, na=False)
+            | view["region_key"].astype(str).apply(norm_text).str.contains(nq, na=False)
+        )
+        view = view[mask]
+
+    if only_missing:
+        view = view[view["region_key"].isna() | (view["region_key"].astype(str).str.strip() == "")]
+
+    if only_not_found:
+        view = view[
+            (view["Provincia"].isna() | (view["Provincia"].astype(str).str.strip() == ""))
+            | (view["Localidad"].isna() | (view["Localidad"].astype(str).str.strip() == ""))
+        ]
+
+    st.caption("Tip: editás inline y recién se guarda cuando tocás **Aplicar cambios**.")
+
+    # -------------------------
+    # Editor inline (st.data_editor)
+    # -------------------------
+    # Columnas que sí querés editar a mano:
+    editable_cols = ["CP", "Provincia", "Localidad", "region_base", "sub_region"]
+    show_cols = editable_cols  # ← SOLO lo del Excel
+
+    edited = st.data_editor(
+        view[show_cols],
+        use_container_width=True,
+        num_rows="dynamic",
+        hide_index=True,
+    )
+
+    # Recalcular (no mostrar) claves internas
+    edited_calc = edited.copy()
+    edited_calc["CP_int"] = edited_calc["CP"].apply(parse_cp_to_int)
+    edited_calc["region_key"] = edited_calc["sub_region"].apply(normalize_region_key)
 
 
-    # =====================
-    # Presentación (pro): separar "Factura" vs "Esperado" vs "Comparación"
-    # =====================
-    try:
-        rep_view = rep.copy()
-        if "disd_factura" in rep_view.columns or "sgd_factura" in rep_view.columns:
-            rep_view["total_factura"] = pd.to_numeric(rep_view.get("disd_factura", 0), errors="coerce").fillna(0) + pd.to_numeric(rep_view.get("sgd_factura", 0), errors="coerce").fillna(0)
+    # Recalcular claves luego de edición
+    def _recalc(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["CP_int"] = df["CP"].apply(parse_cp_to_int)
+        df["region_key"] = df["sub_region"].apply(normalize_region_key)
+        missing = df["region_key"].isna()
+        if "region" in df.columns:
+            df.loc[missing, "region_key"] = df.loc[missing, "region"].apply(normalize_region_key)
+        return df
+
+    edited = _recalc(edited)
+
+    st.divider()
+
+    # -------------------------
+    # Agregar CP manual (rápido)
+    # -------------------------
+    st.subheader("Agregar CP manual (rápido)")
+
+    a1, a2, a3, a4 = st.columns([1, 2, 2, 2])
+    with a1:
+        new_cp = st.text_input("CP", value="")
+    with a2:
+        new_prov = st.text_input("Provincia", value="")
+    with a3:
+        new_loc = st.text_input("Localidad", value="")
+    with a4:
+        new_sub = st.text_input("Sub región (ej: PAT I 64 / LOC 53)", value="")
+
+    if st.button("Agregar / Actualizar este CP"):
+        cp_int = parse_cp_to_int(new_cp)
+        if cp_int is None:
+            st.error("CP inválido.")
         else:
-            rep_view["total_factura"] = None
-        rep_view["total_esperado"] = pd.to_numeric(rep_view.get("disd_esperado_max", 0), errors="coerce").fillna(0) + pd.to_numeric(rep_view.get("sgd_esperado", 0), errors="coerce").fillna(0)
+            rk = normalize_region_key(new_sub) if new_sub.strip() else None
+            row = {
+                "CP": str(new_cp).strip(),
+                "Provincia": str(new_prov).strip(),
+                "Localidad": str(new_loc).strip(),
+                "region_base": None,
+                "sub_region": str(new_sub).strip() if new_sub.strip() else None,
+                "region": None,
+                "CP_int": cp_int,
+                "region_key": rk,
+            }
 
-        # Tramos (bandas de peso) — útil para detectar saltos de rango (no micro-diferencias dentro del mismo tramo)
-        def _band_label(region: str, kg: float, mdf: pd.DataFrame):
-            try:
-                if mdf is None or len(mdf) == 0 or region is None or pd.isna(kg):
-                    return None
-                region_key = str(region).upper().strip()
-                sub = mdf[mdf["region"].astype(str).str.upper().str.strip() == region_key]
-                if len(sub) == 0:
-                    return None
-                kgf = float(kg)
-                hit = sub[(sub["w_from"] <= kgf) & (kgf <= sub["w_to"])]
-                if len(hit) == 0:
-                    return None
-                r0 = hit.iloc[0]
-                wf = int(float(r0["w_from"]))
-                wt = int(float(r0["w_to"]))
-                return f"{wf}-{wt}"
-            except Exception:
-                return None
+            base = cur.copy()
+            base["CP_int"] = base["CP"].apply(parse_cp_to_int)
 
-        if active_raw_df is not None and len(active_raw_df) > 0:
-            rep_view["tramo_factura"] = rep_view.apply(lambda r: _band_label(r.get("region"), r.get("kg_factura"), active_raw_df), axis=1)
-            rep_view["tramo_esperado"] = rep_view.apply(lambda r: _band_label(r.get("region"), r.get("kg_esperado"), active_raw_df), axis=1)
-            rep_view["salto_tramo"] = (rep_view["tramo_factura"].notna()) & (rep_view["tramo_esperado"].notna()) & (rep_view["tramo_factura"] != rep_view["tramo_esperado"])
+            if (base["CP_int"] == cp_int).any():
+                base.loc[base["CP_int"] == cp_int, list(row.keys())] = pd.Series(row)
+                st.success(f"Actualizado CP {cp_int}.")
+            else:
+                base = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
+                st.success(f"Agregado CP {cp_int}.")
+
+            # refrescar en memoria del módulo (no guarda todavía)
+            cur = base
+
+    st.divider()
+
+    # -------------------------
+    # Import incremental (UPSERT por CP)
+    # -------------------------
+    st.subheader("Import incremental (sumar/actualizar CPs desde un archivito)")
+
+    mode = st.radio(
+        "Modo de import",
+        ["Incremental (recomendado)", "Reemplazar todo (peligroso)"],
+        index=0,
+        horizontal=True,
+    )
+
+    up = st.file_uploader("Subí CP Master parcial (xlsx/csv)", type=["xlsx", "xls", "csv"])
+    if up:
+        raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up, engine="openpyxl")
+        norm, warns = normalize_cp_master(raw)
+
+        for w in warns:
+            st.warning(w)
+
+        st.write("Preview del import normalizado")
+        safe_show_df(norm.head(2000), label="cp_master_import_preview")
+
+        base = cur.copy()
+        base["CP_int"] = base["CP"].apply(parse_cp_to_int)
+
+        if mode.startswith("Reemplazar"):
+            merged = norm.copy()
+            added = len(merged)
+            updated = 0
+            same = 0
         else:
-            rep_view["tramo_factura"] = None
-            rep_view["tramo_esperado"] = None
-            rep_view["salto_tramo"] = False
+            # UPSERT por CP_int
+            base_idx = base.set_index("CP_int", drop=False)
+            norm_idx = norm.set_index("CP_int", drop=False)
 
-        rep_view["delta_total"] = pd.to_numeric(rep_view.get("total_factura", 0), errors="coerce") - pd.to_numeric(rep_view.get("total_esperado", 0), errors="coerce")
-        rep_view["flag_sobreprecio_total"] = rep_view["delta_total"].fillna(0) > float(tol_ars)
-        rep_view["flag_peso_inflado_tramo"] = rep_view["salto_tramo"] & (pd.to_numeric(rep_view.get("delta_kg", 0), errors="coerce").fillna(0) > float(tol_kg))
-        rep_view["flag_peso_menor_tramo"] = rep_view["salto_tramo"] & (pd.to_numeric(rep_view.get("delta_kg", 0), errors="coerce").fillna(0) < -float(tol_kg))
+            added_keys = [k for k in norm_idx.index if k not in base_idx.index]
+            common_keys = [k for k in norm_idx.index if k in base_idx.index]
 
-
-        
-        # Sanitización para evitar bugs del front (React #185):
-        # - Fuerza numéricos en columnas de costos/pesos
-        # - Convierte fechas/datetimes a string (estable para el render)
-        # - Elimina índices raros
-        def _sanitize_for_table(df: pd.DataFrame) -> pd.DataFrame:
-            if df is None or len(df) == 0:
-                return df
-            out = df.copy()
-
-            # Numeric columns (safe coercion)
-            for c in ["bultos_factura","kg_factura","kg_esperado","delta_kg",
-                      "disd_factura","sgd_factura","total_factura",
-                      "disd_esperado_max","sgd_esperado","total_esperado",
-                      "delta_disd","delta_sgd","delta_total"]:
-                if c in out.columns:
-                    out[c] = pd.to_numeric(out[c], errors="coerce")
-
-            # Datetime-like to ISO string (works for both datetime64 and python dates)
-            for c in out.columns:
-                s = out[c]
-                if pd.api.types.is_datetime64_any_dtype(s):
-                    out[c] = s.dt.strftime("%Y-%m-%d")
+            # contar cambios reales
+            updated = 0
+            same = 0
+            cols_cmp = ["Provincia", "Localidad", "region_base", "sub_region", "region", "region_key", "CP"]
+            for k in common_keys:
+                a = base_idx.loc[k, cols_cmp].astype(str).fillna("").to_list()
+                b = norm_idx.loc[k, cols_cmp].astype(str).fillna("").to_list()
+                if a == b:
+                    same += 1
                 else:
-                    # object column with python date/datetime
-                    try:
-                        if s.dtype == "object":
-                            sample = s.dropna().head(50)
-                            if len(sample) > 0 and all(isinstance(x, (datetime.date, datetime.datetime, pd.Timestamp)) for x in sample):
-                                out[c] = s.astype(str)
-                    except Exception:
-                        pass
+                    updated += 1
 
-            out = out.reset_index(drop=True)
-            # Evita dtypes "object" ambiguos luego de fillna
+            # aplicar upsert
+            merged = base_idx.copy()
+            # actualiza existentes
+            for k in common_keys:
+                merged.loc[k, norm_idx.columns] = norm_idx.loc[k, norm_idx.columns]
+            # agrega nuevos
+            if added_keys:
+                merged = pd.concat([merged, norm_idx.loc[added_keys]], axis=0)
+
+            merged = merged.reset_index(drop=True)
+
+            added = len(added_keys)
+
+        st.write("Plan de cambios")
+        cA, cB, cC, cD = st.columns(4)
+        cA.metric("Actual (filas)", f"{len(base):,}")
+        cB.metric("Import (filas)", f"{len(norm):,}")
+        cC.metric("Agrega", f"{added:,}")
+        cD.metric("Actualiza", f"{updated:,}")
+
+        if mode.startswith("Incremental"):
+            st.caption(f"Sin cambios (mismos valores): {same:,}")
+
+        st.write("Preview después del merge")
+        safe_show_df(merged.head(2000), label="cp_master_merged_preview")
+
+        confirm = st.checkbox("Confirmo aplicar estos cambios en disco (con backup).")
+        if st.button("Aplicar cambios (guardar CP Master)", disabled=not confirm):
+            backup_file(CP_MASTER_PATH, "cp_master")
+            save_pickle(CP_MASTER_PATH, merged)
+            audit_log("cp_master_apply", {"mode": mode, "import_file": up.name, "rows": len(merged), "added": int(added), "updated": int(updated)})
+            st.success("Listo: CP Master actualizado y guardado.")
+
+
+# =========================
+# Catálogo
+# =========================
+if page == "Catálogo":
+    st.subheader("Catálogo — Import / Simular / Aplicar")
+    cur = get_catalog()
+    if cur is not None:
+        st.caption(f"Dataset actual: {len(cur):,} filas")
+        safe_show_df(cur, label="catalog_actual")
+
+    up = st.file_uploader("Subí Catálogo (xlsx/csv)", type=["xlsx", "xls", "csv"])
+    if up:
+        if up.name.lower().endswith(".csv"):
+            raw = pd.read_csv(up)
+        else:
+            raw = pd.read_excel(up, engine="openpyxl")
+
+        norm, warns = normalize_catalog(raw)
+        st.success(f"OK: Catálogo normalizado ({len(norm):,} filas)")
+        for w in warns:
+            st.warning(w)
+
+        safe_show_df(norm, label="catalog_preview")
+        st.download_button("Descargar preview (Excel)", data=to_excel_bytes(norm, "catalog"), file_name="catalog_normalizado.xlsx")
+
+        confirm = st.checkbox("Confirmo que quiero aplicar cambios (guardar en disco).")
+        if st.button("Aplicar cambios", disabled=not confirm):
+            backup_file(CATALOG_PATH, "catalog")
+            save_pickle(CATALOG_PATH, norm)
+            audit_log("catalog_apply", {"rows": len(norm), "file": up.name})
+            st.success("Listo: Catálogo guardado.")
+
+# =========================
+# Ventas
+# =========================
+if page == "Ventas":
+    st.subheader("Ventas — Import / Simular / Aplicar")
+    cur = get_sales()
+    if cur is not None:
+        st.caption(f"Dataset actual: {len(cur):,} filas")
+        safe_show_df(cur, label="ventas_actual")
+
+    up = st.file_uploader("Subí Ventas (xlsx/csv)", type=["xlsx", "xls", "csv"])
+    if up:
+        if up.name.lower().endswith(".csv"):
+            raw = pd.read_csv(up)
+        else:
+            raw = pd.read_excel(up, engine="openpyxl")
+
+        norm, warns = normalize_sales(raw)
+        st.success(f"OK: Ventas normalizadas ({len(norm):,} filas)")
+        for w in warns:
+            st.warning(w)
+
+        safe_show_df(norm, label="ventas_preview")
+        st.download_button("Descargar preview (Excel)", data=to_excel_bytes(norm, "ventas"), file_name="ventas_normalizadas.xlsx")
+
+        confirm = st.checkbox("Confirmo que quiero aplicar cambios (guardar en disco).")
+        if st.button("Aplicar cambios", disabled=not confirm):
+            backup_file(SALES_PATH, "sales")
+            save_pickle(SALES_PATH, norm)
+            audit_log("sales_apply", {"rows": len(norm), "file": up.name})
+            st.success("Listo: Ventas guardadas.")
+
+# =========================
+# Matriz Andreani
+# =========================
+if page == "Matriz Andreani":
+    st.subheader("Matriz Andreani — Import / Publicar / Usar en auditoría")
+
+    reg = load_registry()
+    mats = [m for m in reg.get("matrices", []) if m.get("kind") == "andreani"]
+    if mats:
+        st.write("Matrices registradas (Andreani)")
+        safe_show_df(pd.DataFrame(mats), label="registry_andreani")
+
+    up = st.file_uploader("Subí Matriz Andreani (xlsx)", type=["xlsx", "xls"])
+    if up:
+        raw = pd.read_excel(up, engine="openpyxl")
+        norm, meta = normalize_andreani_matrix(raw)
+
+        st.success(f"OK: matriz normalizada ({len(norm):,} filas / {len(meta.get('regions', []))} regiones)")
+        st.write("Preview normalizado (long)")
+        safe_show_df(norm.head(2000), label="matriz_andreani_preview")
+
+        st.download_button("Descargar preview (Excel)", data=to_excel_bytes(norm, "matrix_andreani"), file_name="matriz_andreani_normalizada.xlsx")
+
+        st.divider()
+        st.write("Guardar versión")
+        name = st.text_input("Nombre versión (ej: 'Andreani diciembre')", value=os.path.splitext(up.name)[0])
+        status = st.selectbox("Estado", ["DRAFT", "PUBLISHED"], index=1)
+        c1, c2 = st.columns(2)
+        with c1:
+            valid_from = st.date_input("Vigente desde", value=today())
+        with c2:
+            valid_to = st.date_input("Vigente hasta (opcional)", value=None)
+
+        confirm = st.checkbox("Confirmo guardar esta versión en disco.")
+        if st.button("Guardar versión", disabled=not confirm):
+            # persistir pkl
+            file_path = os.path.join(MATRIX_DIR, f"andreani__{re.sub(r'[^a-zA-Z0-9_-]+','_',name).lower()}.pkl")
+            backup_file(file_path, f"matrix_andreani_{name}")
+            save_pickle(file_path, norm)
+
+            upsert_matrix_version(
+                name=name.strip(),
+                kind="andreani",
+                status=status,
+                valid_from=valid_from.strftime("%Y-%m-%d") if valid_from else None,
+                valid_to=valid_to.strftime("%Y-%m-%d") if valid_to else None,
+                file_path=file_path,
+                meta=meta,
+            )
+            audit_log("matrix_andreani_save", {"name": name, "status": status, "file": up.name})
+            st.success("Listo: matriz guardada y registrada.")
+
+# =========================
+# Auditor Facturas (PRO: matriz por guía + outputs por paso)
+# =========================
+if page == "Auditor Facturas":
+    st.subheader("Auditor de facturas (PDF) — Andreani (PRO por guía)")
+
+    cp_master = get_cp_master()
+    catalog = get_catalog()
+    sales = get_sales()
+
+    missing = []
+    if cp_master is None:
+        missing.append("CP Master")
+    if catalog is None:
+        missing.append("Catálogo")
+    if sales is None:
+        missing.append("Ventas")
+    if missing:
+        st.error(f"Faltan datasets requeridos: {', '.join(missing)}. Cargalos primero.")
+        st.stop()
+
+    # Fallback manual (si falta fecha_envio / fecha_factura)
+    ref_date = st.date_input("Fecha de referencia (fallback si falta fecha_envío)", value=today())
+
+    pdfs = st.file_uploader("Subí factura(s) PDF", type=["pdf"], accept_multiple_files=True)
+    if not pdfs:
+        st.info("Subí al menos un PDF para auditar.")
+        st.stop()
+
+    # Índices
+    cp_idx = cp_master.set_index("CP_int", drop=False)
+    catalog_idx = catalog.drop_duplicates(subset=["sku"], keep="last").set_index("sku", drop=False)
+
+    sales_norm = sales.copy()
+    sales_norm["guia"] = sales_norm["guia"].apply(normalize_guia)
+
+    # --- Cache de matrices en memoria para performance ---
+    matrix_cache: Dict[str, pd.DataFrame] = {}
+
+    def _get_matrix_for_date(base_date: dt.date) -> Tuple[Optional[Dict[str, Any]], Optional[pd.DataFrame]]:
+        """Devuelve (mrec, matrix_long) para marketplace=andreani según base_date (por guía)."""
+        mrec = pick_active_matrix("andreani", base_date)
+        if not mrec:
+            return None, None
+        fp = mrec.get("file_path")
+        if not fp:
+            return mrec, None
+        if fp not in matrix_cache:
+            matrix_cache[fp] = load_pickle(fp)
+        return mrec, matrix_cache[fp]
+
+    def _map_cp(cp_int: Any) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """
+        Devuelve:
+        provincia, localidad, sub_region, region_key
+        - region_key se calcula SOLO desde sub_region (tu estándar)
+        """
+        if cp_int is None or (isinstance(cp_int, float) and math.isnan(cp_int)):
+            return None, None, None, None
+        try:
+            cp_int = int(cp_int)
+        except Exception:
+            return None, None, None, None
+
+        if cp_int not in cp_idx.index:
+            return None, None, None, None
+
+        r = cp_idx.loc[cp_int]
+        prov = r.get("Provincia")
+        loc = r.get("Localidad")
+
+        sub = r.get("sub_region")
+        rk = normalize_region_key(sub) if sub else None
+
+        return prov, loc, sub, rk
+
+
+    # --- Helpers de peso esperado desde catálogo (sku*qty) ---
+    def _line_weight(row) -> float:
+        sku = str(row.get("sku", "")).strip()
+        qty = float(row.get("qty", 1) or 1)
+        if sku in catalog_idx.index:
+            w = catalog_idx.loc[sku, "peso_aforado_kg"]
             try:
-                out = out.infer_objects(copy=False)
+                return float(w) * qty
             except Exception:
-                pass
-            return out
+                return 0.0
+        return 0.0
 
-        rep_show = _sanitize_for_table(rep_view)
+    results_all: List[pd.DataFrame] = []
+    step1_all: List[pd.DataFrame] = []
+    step2_all: List[pd.DataFrame] = []
+    step3_all: List[pd.DataFrame] = []
+    step4_all: List[pd.DataFrame] = []
+    step5_all: List[pd.DataFrame] = []
 
-        t1, t2, t3 = st.tabs(["Factura (PDF)", "Esperado (Base)", "Comparación"])
-        with t1:
-            cols = [c for c in [
-                "guia","invoice_issue_date","fecha_factura","bultos_factura","kg_factura","disd_factura","sgd_factura","total_factura"
-            ] if c in rep_view.columns]
-            st.dataframe(rep_show[cols].rename(columns={
-                "invoice_issue_date":"fecha_emision_factura",
-                "fecha_factura":"fecha_envio_pdf",
-            }), use_container_width=True, height=420)
+    for up in pdfs:
+        # -----------------
+        # Paso 1: PDF → envíos
+        # -----------------
+        ship = parse_pdf_shipments(up.read())
+        ship["source_pdf"] = up.name
+        step1_all.append(ship.copy())
 
-        with t2:
-            cols = [c for c in [
-                "guia","fecha_base","matrix_name","region","cp","provincia","localidad","kg_esperado","disd_esperado_max","sgd_esperado","total_esperado"
-            ] if c in rep_view.columns]
-            st.dataframe(rep_show[cols], use_container_width=True, height=420)
+        if ship.empty:
+            st.warning(f"No pude extraer envíos del PDF: {up.name}")
+            continue
 
-        with t3:
-            cols = [c for c in [
-                "estado","guia","fecha_factura","fecha_base","matrix_name",
-                "cp","provincia","localidad","region",
-                "kg_factura","kg_esperado","tramo_factura","tramo_esperado","salto_tramo","delta_kg",
-                "disd_factura","disd_esperado_max","delta_disd",
-                "sgd_factura","sgd_esperado","delta_sgd",
-                "total_factura","total_esperado","delta_total"
-            ] if c in rep_view.columns]
+        # -----------------
+        # Paso 2: Ventas → CP + fecha_envio + kg_esperado
+        # -----------------
+        s = sales_norm.dropna(subset=["guia"]).copy()
+        s["line_weight"] = s.apply(_line_weight, axis=1)
+        by_guia = s.groupby("guia", as_index=False).agg(
+            cp_int=("cp_int", "first"),
+            fecha_envio=("fecha_envio", "first"),
+            kg_esperado=("line_weight", "sum"),
+        )
+        step2 = ship.merge(by_guia, on="guia", how="left", indicator=True)
+        step2["flag_sin_venta"] = step2["_merge"].ne("both")
+        step2 = step2.drop(columns=["_merge"])
+        step2_all.append(step2.copy())
 
-            only_diff = st.checkbox("Mostrar solo envíos con diferencias / alertas", value=True, key="only_diff")
-            view = rep_view[cols].copy()
+        # -----------------
+        # Paso 3: CP master → región/subregión (region_key)
+        # -----------------
+        mapped = step2["cp_int"].apply(_map_cp)
+        step3 = step2.copy()
+        step3["provincia"] = mapped.apply(lambda x: x[0])
+        step3["localidad"] = mapped.apply(lambda x: x[1])
+        step3["region_key"] = mapped.apply(lambda x: x[2])
+        step3["flag_cp_no_encontrado"] = step3["cp_int"].notna() & step3["provincia"].isna()
+        step3["flag_sin_region"] = step3["region_key"].isna()
+        step3_all.append(step3.copy())
 
-            # criterio de diferencia: por estado o por deltas fuera de tolerancia
-            if only_diff and "estado" in view.columns:
-                # todo lo que no sea OK
-                view = view[view["estado"].astype(str).str.upper().ne("OK")].copy()
+        # -----------------
+        # Paso 4: seleccionar matriz por guía según fecha_envio (fallback)
+        # -----------------
+        def _pick_base_date(row) -> Tuple[dt.date, str]:
+            fe = row.get("fecha_envio")
+            ff = row.get("fecha_factura")
+            if isinstance(fe, dt.date) and not pd.isna(fe):
+                return fe, "ventas.fecha_envio"
+            if isinstance(ff, dt.date) and not pd.isna(ff):
+                return ff, "pdf.fecha_factura"
+            return ref_date, "manual.ref_date"
 
-            # Coloreo: rojo si sobreprecio / peso inflado (salto de banda), verde si es "a favor" (más liviano y cambia banda)
-            def _band_for(region: str, kg: float, mdf: pd.DataFrame):
-                if mdf is None or mdf.empty or region is None or kg is None or pd.isna(kg):
-                    return None
-                sub = mdf[mdf["region"].astype(str).str.upper() == str(region).upper()].copy()
-                if sub.empty:
-                    return None
-                sub = sub.sort_values(["w_from","w_to"])
-                hit = sub[(sub["w_from"] <= kg) & (kg <= sub["w_to"])]
-                if hit.empty:
-                    return None
-                # id por índice ordenado
-                return int(hit.iloc[0].name)
+        base = step3.apply(_pick_base_date, axis=1)
+        step4 = step3.copy()
+        step4["fecha_base"] = base.apply(lambda x: x[0])
+        step4["fecha_base_source"] = base.apply(lambda x: x[1])
 
-            # Matriz RAW activa (si existe) para inferir salto de banda
-            active_raw_df = None
-            try:
-                # en el auditor ya existe active (o similar). Si no, queda None.
-                if "active" in locals() and isinstance(active, dict) and "df" in active:
-                    active_raw_df = active["df"]
-                elif "active_raw" in locals() and isinstance(active_raw, dict) and "df" in active_raw:
-                    active_raw_df = active_raw["df"]
-            except Exception:
-                active_raw_df = None
+        # matriz por fila (guardamos name/path)
+        def _matrix_meta(row) -> Tuple[Optional[str], Optional[str]]:
+            mrec, _ = _get_matrix_for_date(row["fecha_base"])
+            if not mrec:
+                return None, None
+            return mrec.get("name"), mrec.get("file_path")
 
-            try:
-                def style_row(row):
-                    # Colorea solo lo que importa para la auditoría (deltas + saltos de tramo)
-                    styles = pd.Series('', index=row.index, dtype='object')
-                    def _paint(col, val):
-                        try:
-                            fval = float(val)
-                        except Exception:
-                            return
-                        if fval > float(tol_ars):
-                            styles[col] = 'background-color: #fde2e2;'
-                        elif fval < -float(tol_ars):
-                            styles[col] = 'background-color: #e7f7ec;'
-                
-                    for col in ['delta_total', 'delta_disd', 'delta_sgd', 'delta_kg']:
-                        if col in row.index:
-                            _paint(col, row[col])
-                
-                    if 'salto_tramo' in row.index and bool(row.get('salto_tramo')):
-                        for col in ['tramo_factura', 'tramo_esperado']:
-                            if col in row.index:
-                                styles[col] = 'background-color: #fff1cc;'
-                    return styles
-                
-                styled = view.style.apply(style_row, axis=1)
-                st.dataframe(styled, use_container_width=True, hide_index=True)
-            except Exception:
-                st.dataframe(view, use_container_width=True, hide_index=True)
+        mm = step4.apply(_matrix_meta, axis=1)
+        step4["matrix_name_usada"] = mm.apply(lambda x: x[0])
+        step4["matrix_path_usada"] = mm.apply(lambda x: x[1])
+        step4["flag_sin_matriz"] = step4["matrix_name_usada"].isna()
+        step4_all.append(step4.copy())
 
+        # -----------------
+        # Paso 5: tarifa esperada con (region_key + kg_factura) en matriz RAW seleccionada
+        # -----------------
+        def _expected_from_matrix(row) -> Tuple[Optional[float], str]:
+            if row.get("flag_sin_matriz"):
+                return None, "SIN MATRIZ (no hay PUBLISHED vigente)"
+            rk = row.get("region_key")
+            if not rk:
+                return None, "SIN REGIÓN (CP no mapea)"
 
-    except Exception:
-        # Fallback silencioso: si el render de tabs falla, evitamos ruido en la interfaz.
-        pass
+            kg_fact = row.get("kg_factura")
+            if kg_fact is None or (isinstance(kg_fact, float) and math.isnan(kg_fact)) or kg_fact <= 0:
+                return None, "SIN PESO FACTURA"
 
+            mrec, mdf = _get_matrix_for_date(row["fecha_base"])
+            if mdf is None:
+                return None, "SIN MATRIZ (archivo no cargó)"
 
-    cols = [
-        "estado","guia","fecha_base","matrix_name","fecha_factura","fecha_envio","cp","provincia","localidad","region",
-        "bultos_factura","kg_factura","kg_esperado","delta_kg",
-        "disd_factura","disd_esperado_max","delta_disd",
-        "sgd_factura","sgd_esperado","delta_sgd",
-        "total_factura","flag_sin_venta"
-    ]
-    cols = [c for c in cols if c in rep.columns]
-    st.dataframe(rep[cols].sort_values(["estado","guia"]), use_container_width=True, height=620)
+            val, exc, status = tariff_lookup(mdf, region_key=str(rk), kg=float(kg_fact))
+            if val is None:
+                if status == "SIN_REGION_EN_MATRIZ":
+                    return None, "SIN TARIFA (región no existe en matriz)"
+                if status == "SIN_BANDA_SIN_EXC":
+                    return None, "SIN TARIFA (kg excede y no hay Exc)"
+                return None, "SIN TARIFA (no matchea banda)"
+            # si usó excedente, lo declaramos
+            if status == "OK_EXCEDENTE":
+                return float(val), "OK (EXCEDENTE)"
+            return float(val), "OK"
 
-    # KPIs (día a día)
-    total_envios = int(len(rep))
-    ok_cnt = int((rep["estado"] == "OK").sum())
-    alert_cnt = int((rep["estado"] != "OK").sum())
-    sin_venta_cnt = int((rep["estado"].astype(str).str.contains("SIN VENTA")).sum()) if "estado" in rep.columns else 0
+        exp = step4.apply(_expected_from_matrix, axis=1)
+        step5 = step4.copy()
+        step5["disd_esperado"] = exp.apply(lambda x: x[0])
+        step5["tarifa_status"] = exp.apply(lambda x: x[1])
+        step5_all.append(step5.copy())
 
-    if "delta_total" in rep.columns:
-        sobreprecio_total = float(pd.to_numeric(rep["delta_total"], errors="coerce").fillna(0).clip(lower=0).sum())
-        sobreprecio_cnt = int((rep.get("flag_sobreprecio_total", False) == True).sum()) if "flag_sobreprecio_total" in rep.columns else int((rep["delta_total"].fillna(0) > float(tol_ars)).sum())
-    else:
-        sobreprecio_total = float(pd.to_numeric(rep.get("delta_disd", 0), errors="coerce").fillna(0).clip(lower=0).sum())
-        sobreprecio_cnt = int((rep["estado"] == "SOBREPRECIO DISD").sum()) if "estado" in rep.columns else 0
+        # -----------------
+        # Paso 6: comparar pesos (kg_factura vs kg_esperado catálogo)
+        # -----------------
+        out = step5.copy()
 
-    salto_tramo_cnt = int((rep.get("salto_tramo", False) == True).sum()) if "salto_tramo" in rep.columns else int((rep["estado"] == "PESO INFLADO").sum())
+        out["delta_kg"] = out["kg_factura"] - out["kg_esperado"]
+        out["delta_disd"] = out["disd_factura"] - out["disd_esperado"]
 
-    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    r1c1.metric("Envíos", total_envios)
-    r1c2.metric("OK", ok_cnt)
-    r1c3.metric("Alertas", alert_cnt)
-    r1c4.metric("Sobreprecio estimado ($)", f"{sobreprecio_total:,.2f}")
+        # Estado final: prioriza fallas de data / matching
+        def _final_state(r) -> str:
+            if r.get("flag_sin_venta"):
+                return "SIN VENTA"
+            if r.get("flag_cp_no_encontrado"):
+                return "CP NO ENCONTRADO"
+            if r.get("flag_sin_region"):
+                return "SIN REGIÓN"
+            if r.get("flag_sin_matriz"):
+                return "SIN MATRIZ"
+            if not r.get("disd_esperado") or (isinstance(r.get("disd_esperado"), float) and math.isnan(r.get("disd_esperado"))):
+                return r.get("tarifa_status") or "SIN TARIFA"
+            return "OK"
 
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.metric("Saltos de tramo", salto_tramo_cnt)
-    r2c2.metric("Sobreprecio (casos)", sobreprecio_cnt)
-    r2c3.metric("Sin venta", sin_venta_cnt)
-    r2c4.metric("Tolerancias", f"${tol_ars} / {tol_kg}kg")
+        out["estado_final"] = out.apply(_final_state, axis=1)
 
+        # columnas finales
+        cols = [
+            "estado_final",
+            "tarifa_status",
+            "guia",
+            "source_pdf",
+            "fecha_factura",
+            "fecha_envio",
+            "fecha_base",
+            "fecha_base_source",
+            "matrix_name_usada",
+            "cp_int",
+            "provincia",
+            "localidad",
+            "region_key",
+            "bultos_factura",
+            "kg_factura",
+            "kg_esperado",
+            "delta_kg",
+            "disd_factura",
+            "disd_esperado",
+            "delta_disd",
+            "sgd_factura",
+            "flag_sin_venta",
+            "flag_cp_no_encontrado",
+            "flag_sin_region",
+            "flag_sin_matriz",
+        ]
+        out = out[cols].rename(columns={"cp_int": "cp"})
+        results_all.append(out)
 
-    # Costo promedio por envío (factura) incluyendo seguro/SGD + IVA
-    # (si no hay YAML, usamos 21% como default)
-    iva_rate = float(((config or {})
-                     .get("tax", {})
-                     .get("iva_rate", 0.21)))
-    # Factura: total_factura ya es DISD + SGD (sin IVA)
-    fact_mask = rep["total_factura"].notna() if "total_factura" in rep.columns else pd.Series([False]*len(rep))
-    fact_avg = float(rep.loc[fact_mask, "total_factura"].mean()) if fact_mask.any() else 0.0
-    fact_avg_iva = fact_avg * (1.0 + iva_rate)
+    if not results_all:
+        st.error("No se generaron resultados (no pude parsear ningún PDF).")
+        st.stop()
 
-    # Esperado (base): total_esperado ya es DISD esperado + SGD esperado (sin IVA)
-    exp_mask = rep.get("matrix_name", pd.Series([None]*len(rep))).notna() if len(rep) else pd.Series(dtype=bool)
-    exp_avg = float(rep.loc[exp_mask, "total_esperado"].mean()) if (len(rep) and exp_mask.any() and "total_esperado" in rep.columns) else 0.0
-    exp_avg_iva = exp_avg * (1.0 + iva_rate)
+    # ==================
+    # OUTPUTS por paso
+    # ==================
+    st.divider()
+    st.subheader("Resultados por paso (debug transparente)")
 
-    delta_avg_iva = (fact_avg - exp_avg) * (1.0 + iva_rate)
+    with st.expander("Paso 1 — PDF parseado (envíos encontrados)", expanded=False):
+        df1 = pd.concat(step1_all, ignore_index=True) if step1_all else pd.DataFrame()
+        safe_show_df(df1, label="paso1_pdf_parse")
 
-    r3c1, r3c2, r3c3 = st.columns(3)
-    r3c1.metric("Costo promedio factura (con IVA)", f"${fact_avg_iva:,.2f}")
-    r3c2.metric("Costo promedio esperado (con IVA)", f"${exp_avg_iva:,.2f}")
-    r3c3.metric("Delta promedio (con IVA)", f"${delta_avg_iva:,.2f}")
+    with st.expander("Paso 2 — Cruce con Ventas (CP, fecha_envío, kg_esperado)", expanded=False):
+        df2 = pd.concat(step2_all, ignore_index=True) if step2_all else pd.DataFrame()
+        safe_show_df(df2, label="paso2_ventas_merge")
 
-    with st.expander("Glosario (qué significa delta_*)", expanded=False):
-        st.markdown("""
-        - **delta_kg** = `kg_factura - kg_esperado` (positivo => te cobraron por más kg).
-        - **delta_disd** = `disd_factura - disd_esperado_max`.
-        - **delta_sgd** = `sgd_factura - sgd_esperado`.
-        - **delta_total** = `total_factura - total_esperado` (tu número final para auditoría).
-        - **salto_tramo**: el tramo (banda) de kg de la factura != el tramo esperado (esto sí importa).
-        """)
+    with st.expander("Paso 3 — CP Master (provincia/localidad/region_key)", expanded=False):
+        df3 = pd.concat(step3_all, ignore_index=True) if step3_all else pd.DataFrame()
+        safe_show_df(df3, label="paso3_cp_master")
+
+    with st.expander("Paso 4 — Selección de matriz por guía (según fecha)", expanded=False):
+        df4 = pd.concat(step4_all, ignore_index=True) if step4_all else pd.DataFrame()
+        safe_show_df(df4[["guia","source_pdf","fecha_envio","fecha_factura","fecha_base","fecha_base_source","matrix_name_usada","flag_sin_matriz"]], label="paso4_matriz_por_guia")
+
+        # resumen matrices usadas
+        if not df4.empty:
+            summary = df4.groupby(["matrix_name_usada"], dropna=False).size().reset_index(name="envios")
+            st.write("Resumen de matrices usadas")
+            safe_show_df(summary, label="resumen_matrices_usadas")
+
+    with st.expander("Paso 5 — Tarifa esperada (region_key + kg_factura → matriz RAW)", expanded=False):
+        df5 = pd.concat(step5_all, ignore_index=True) if step5_all else pd.DataFrame()
+        safe_show_df(df5[["guia","region_key","kg_factura","matrix_name_usada","disd_esperado","tarifa_status"]], label="paso5_tarifa")
+
+    # ==================
+    # Resultado final
+    # ==================
+    res = pd.concat(results_all, ignore_index=True)
+
+    st.divider()
+    st.subheader("Resultado final (auditoría)")
+
+    safe_show_df(res, label="auditoria_result_final")
 
     st.download_button(
-        "Descargar reporte (Excel)",
-        to_excel_bytes(rep[cols], "auditoria"),
-        f"auditoria_andreani_{today().isoformat()}.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "Descargar auditoría (Excel)",
+        data=to_excel_bytes(res, "auditoria"),
+        file_name=f"auditoria_andreani_{today().isoformat()}.xlsx",
     )
-
-
+# =========================
+# Audit trail
+# =========================
 if page == "Audit Trail":
-    st.subheader("Audit Trail")
-    n = st.slider("Últimos N", 50, 2000, 400, 50)
-    df = read_audit_tail(n)
-    if df.empty:
-        st.info("Sin eventos todavía.")
+    st.subheader("Audit trail (últimos eventos)")
+    if not os.path.exists(AUDIT_LOG_PATH):
+        st.info("Aún no hay audit log.")
     else:
-        st.dataframe(df, use_container_width=True, height=650)
-        st.download_button("Descargar (CSV)", df.to_csv(index=False).encode("utf-8"), "audit_log.csv", "text/csv")
+        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-300:]
+        rows = [json.loads(x) for x in lines if x.strip()]
+        df = pd.json_normalize(rows).sort_values("ts", ascending=False) if rows else pd.DataFrame()
+        safe_show_df(df, label="audit_trail")
