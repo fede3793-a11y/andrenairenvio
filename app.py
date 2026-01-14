@@ -88,6 +88,76 @@ def norm_text(s: Any) -> str:
     return s
 
 
+def read_excel_best_sheet(file_obj, *, prefer_sheets=None) -> Tuple[pd.DataFrame, str]:
+    """Lee un Excel eligiendo la hoja correcta automáticamente.
+    Preferimos hojas tipo MATRIZ_RAW / MATRIZ / etc. para evitar leer INSTRUCCIONES por error.
+    Devuelve (df, sheet_name).
+    """
+    prefer_sheets = prefer_sheets or []
+    try:
+        xls = pd.ExcelFile(file_obj, engine="openpyxl")
+        sheets = list(xls.sheet_names)
+        # 1) match exact prefers (normalizado)
+        prefers_norm = [norm_text(s) for s in prefer_sheets]
+        for s in sheets:
+            if norm_text(s) in prefers_norm:
+                return pd.read_excel(xls, sheet_name=s), s
+        # 2) heurística: primera hoja que contenga 'matriz'
+        for s in sheets:
+            if "matriz" in norm_text(s):
+                return pd.read_excel(xls, sheet_name=s), s
+        # 3) fallback: primera hoja
+        return pd.read_excel(xls, sheet_name=sheets[0]), sheets[0]
+    except Exception:
+        # fallback ultra-safe
+        return pd.read_excel(file_obj, engine="openpyxl"), ""
+
+def provinces_ar() -> list[str]:
+    return [
+        "Buenos Aires",
+        "CABA",
+        "Catamarca",
+        "Chaco",
+        "Chubut",
+        "Córdoba",
+        "Corrientes",
+        "Entre Ríos",
+        "Formosa",
+        "Jujuy",
+        "La Pampa",
+        "La Rioja",
+        "Mendoza",
+        "Misiones",
+        "Neuquén",
+        "Río Negro",
+        "Salta",
+        "San Juan",
+        "San Luis",
+        "Santa Cruz",
+        "Santa Fe",
+        "Santiago del Estero",
+        "Tierra del Fuego",
+        "Tucumán",
+    ]
+
+
+def list_subregions_from_cp_master(cp_master: "pd.DataFrame") -> list[str]:
+    """Sub_region tal como está en tu CP Master (sin inventar)."""
+    if cp_master is None or cp_master.empty or "sub_region" not in cp_master.columns:
+        return []
+    vals = (
+        cp_master["sub_region"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+    vals = [v for v in vals if v]  # no vacíos
+    vals.sort()
+    return vals
+
+
 def parse_cp_to_int(cp: Any) -> Optional[int]:
     """Convierte CP a entero (tolerante a Excel / strings con separadores / CP con letras)."""
     if cp is None:
@@ -121,6 +191,34 @@ def parse_cp_to_int(cp: Any) -> Optional[int]:
 
     return int("".join(digits))
 
+
+
+def within_tol(actual: Any, expected: Any, *, abs_tol: float = 0.0, pct_tol: float = 0.0) -> bool:
+    """True si |actual-expected| <= max(abs_tol, pct_tol*expected). pct_tol en [0..1]."""
+    if actual is None or expected is None:
+        return False
+    try:
+        a = float(actual)
+        e = float(expected)
+    except Exception:
+        return False
+    if isinstance(e, float) and math.isnan(e):
+        return False
+    if e == 0:
+        return abs(a - e) <= float(abs_tol)
+    band = max(float(abs_tol), float(pct_tol) * abs(e))
+    return abs(a - e) <= band
+
+
+def tol_band(expected: Any, *, abs_tol: float = 0.0, pct_tol: float = 0.0) -> float:
+    """Ancho de tolerancia permitido para un expected dado."""
+    try:
+        e = float(expected)
+    except Exception:
+        return float(abs_tol)
+    if isinstance(e, float) and math.isnan(e):
+        return float(abs_tol)
+    return max(float(abs_tol), float(pct_tol) * abs(e))
 
 def ar_money_to_float(x: Any) -> Optional[float]:
     """Convierte '93.263,21' -> 93263.21"""
@@ -345,49 +443,137 @@ def normalize_catalog(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return df.reset_index(drop=True), warnings
 
 
-def normalize_sales(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    warnings: List[str] = []
+def normalize_sales(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
+    """
+    Normaliza Ventas SIN frenar por CP inválido.
+    Devuelve:
+      - norm: filas válidas (se importan)
+      - warns: warnings
+      - dropped: filas descartadas (ej: sin guia o sin sku), con motivo
+    Requeridas: guia, cp, sku, qty
+    Opcionales: fecha_envio (YYYY-MM-DD), valor_declarado_ars
+    """
+    warns: List[str] = []
     df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
+
+    # --- rename tolerante ---
+    rename = {}
+    for c in list(df.columns):
+        nc = norm_text(c)
+        if nc in {"guia", "nro guia", "numero guia", "tracking", "tracking_id"}:
+            rename[c] = "guia"
+        elif nc in {"cp", "codigo postal", "codigopostal", "cod postal", "codpostal"}:
+            rename[c] = "cp"
+        elif nc in {"sku", "producto", "item", "codigo sku"}:
+            rename[c] = "sku"
+        elif nc in {"qty", "cantidad", "cant"}:
+            rename[c] = "qty"
+        elif nc in {"fecha_envio", "fecha envio", "fecha"}:
+            rename[c] = "fecha_envio"
+        elif nc in {"valor_declarado_ars", "valor declarado", "valor_declarado", "declarado"}:
+            rename[c] = "valor_declarado_ars"
+
+    if rename:
+        df = df.rename(columns=rename)
 
     required = {"guia", "cp", "sku", "qty"}
     missing = sorted(list(required - set(df.columns)))
     if missing:
         raise ValueError(f"Ventas: faltan columnas {missing}. Requeridas: {sorted(required)}")
 
-    df["guia"] = df["guia"].apply(normalize_guia)
-    if df["guia"].isna().any():
-        raise ValueError("Ventas: hay filas con guía vacía/ilegible.")
-    if df["guia"].astype(str).str.contains(r"[eE]\+").any():
-        raise ValueError("Ventas: hay guías en notación científica. Exportalas como TEXTO o usá la plantilla.")
+    # --- tipos base ---
+    df["guia"] = df["guia"].astype("string").str.strip()
+    df["sku"] = df["sku"].astype("string").str.strip()
 
-    df["sku"] = df["sku"].astype(str).str.strip()
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(float)
+    # qty numérica
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    bad_qty = df["qty"].isna() | (df["qty"] <= 0)
+    if bad_qty.any():
+        warns.append(f"Ventas: {int(bad_qty.sum())} filas con qty inválida (se setean a 1).")
+        df.loc[bad_qty, "qty"] = 1.0
 
-    # fecha_envio opcional
+    # --- CP: NO frenar, solo marcar ---
+    df["cp_raw"] = df["cp"]
+    df["cp_int"] = df["cp"].apply(parse_cp_to_int)
+    df["flag_cp_invalido"] = df["cp_int"].isna()
+
+    if df["flag_cp_invalido"].any():
+        warns.append(
+            f"Ventas: {int(df['flag_cp_invalido'].sum())} filas con CP inválido/vacío "
+            "(se cargan igual; auditoría marcará SIN REGIÓN)."
+        )
+
+    # --- fecha_envio opcional ---
     if "fecha_envio" in df.columns:
         df["fecha_envio"] = pd.to_datetime(df["fecha_envio"], errors="coerce").dt.date
-        bad = df["fecha_envio"].isna().sum()
-        if bad > 0:
-            warnings.append("Ventas: hay filas con fecha_envio inválida o vacía (se ignora y auditor usa fecha del PDF).")
-        # limpieza de fechas absurdas
-        try:
-            too_old = df["fecha_envio"].apply(lambda d: (d is not None) and (not pd.isna(d)) and (d < dt.date(2000, 1, 1)))
-            if too_old.any():
-                df.loc[too_old, "fecha_envio"] = pd.NaT
-                warnings.append("Ventas: se detectaron fechas muy viejas en fecha_envio y se anularon (NaT).")
-        except Exception:
-            pass
+        if df["fecha_envio"].isna().any():
+            warns.append(
+                f"Ventas: {int(df['fecha_envio'].isna().sum())} filas sin fecha_envio válida "
+                "(se usará fallback en auditoría)."
+            )
     else:
-        df["fecha_envio"] = pd.NaT
-        warnings.append("Ventas: no se cargó fecha_envio (opcional). Auditor usa fecha del PDF.")
+        df["fecha_envio"] = None
+        warns.append("Ventas: falta columna fecha_envio (opcional). Auditoría usará fallback.")
 
-    df["cp"] = df["cp"].astype(str).str.strip()
-    df["cp_int"] = df["cp"].apply(parse_cp_to_int)
-    if df["cp_int"].isna().any():
-        raise ValueError("Ventas: hay CP inválidos.")
+    # --- valor declarado opcional ---
+    if "valor_declarado_ars" in df.columns:
+        df["valor_declarado_ars"] = pd.to_numeric(df["valor_declarado_ars"], errors="coerce")
+    else:
+        df["valor_declarado_ars"] = None
+        warns.append("Ventas: falta valor_declarado_ars (opcional). Seguro (SGD) se calculará solo con fijo.")
 
-    return df.reset_index(drop=True), warnings
+    # --- separar descartadas (sin guia o sin sku) ---
+    bad_guia = df["guia"].isna() | (df["guia"].astype("string").str.len() == 0)
+    bad_sku = df["sku"].isna() | (df["sku"].astype("string").str.len() == 0)
+    bad_core = bad_guia | bad_sku
+
+    dropped = df[bad_core].copy()
+
+    # SIEMPRE existe drop_reason, incluso si dropped está vacío (clave para que no rompa el reintento)
+    dropped["drop_reason"] = ""
+
+    if not dropped.empty:
+        dropped.loc[bad_guia, "drop_reason"] += "SIN_GUIA; "
+        dropped.loc[bad_sku, "drop_reason"] += "SIN_SKU; "
+        dropped["drop_reason"] = dropped["drop_reason"].str.strip()
+        warns.append(
+            f"Ventas: {int(len(dropped))} filas sin guia o sin sku se eliminaron (descargables)."
+        )
+
+    # --- norm: lo que queda ---
+    norm = df[~bad_core].copy()
+
+    out_cols = [
+        "guia",
+        "cp",
+        "cp_int",
+        "sku",
+        "qty",
+        "fecha_envio",
+        "valor_declarado_ars",
+        "flag_cp_invalido",
+    ]
+
+    # columnas para exportar dropped (todo lo original + drop_reason al final)
+    drop_cols = [c for c in df.columns if c != "drop_reason"]
+
+    dropped_out = dropped.copy()
+
+    # ✅ asegurar columna siempre, incluso si dropped_out está vacío
+    if "drop_reason" not in dropped_out.columns:
+        dropped_out["drop_reason"] = ""
+
+    # ✅ asegurar que existan todas las columnas esperadas sin explotar
+    dropped_out = dropped_out.reindex(columns=drop_cols + ["drop_reason"])
+
+    return (
+        norm[out_cols].reset_index(drop=True),
+        warns,
+        dropped_out.reset_index(drop=True),
+    )
+
+
+
 
 
 def normalize_cp_master(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
@@ -489,11 +675,30 @@ def normalize_andreani_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,
     if "Exc" not in df.columns:
         raise ValueError("Matriz Andreani: falta columna 'Exc' (excedente por kg).")
 
+    
+    # Seguro (SGD) — opcional (se calcula como: fijo + pct*max(0, valor_declarado - umbral))
+    # Permitimos variantes de nombre por robustez.
+    def _colpick(canon: str, aliases: List[str]) -> Optional[str]:
+        if canon in df.columns:
+            return canon
+        for a in aliases:
+            cand = [c for c in df.columns if norm_text(c) == norm_text(a)]
+            if cand:
+                return cand[0]
+        return None
+
+    sgd_fijo_col = _colpick("SGD_FIJO", ["sgd fijo", "seguro fijo", "sgd_fijo"])
+    sgd_umbral_col = _colpick("SGD_UMBRAL", ["sgd umbral", "umbral seguro", "sgd_umbral", "seguro umbral"])
+    sgd_pct_col = _colpick("SGD_PCT_EXCESO", ["sgd pct exceso", "sgd_pct_exceso", "pct exceso seguro", "seguro pct exceso", "sgd % exceso"])
     rows: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         region_raw = r.get("Region ME1")
         region_key = normalize_region_key(region_raw) or str(region_raw).strip().upper()
         exc = pd.to_numeric(r.get("Exc"), errors="coerce")
+
+        sgd_fijo = pd.to_numeric(r.get(sgd_fijo_col), errors="coerce") if sgd_fijo_col else float("nan")
+        sgd_umbral = pd.to_numeric(r.get(sgd_umbral_col), errors="coerce") if sgd_umbral_col else float("nan")
+        sgd_pct_exceso = pd.to_numeric(r.get(sgd_pct_col), errors="coerce") if sgd_pct_col else float("nan")
 
         for bc in band_cols:
             b = parse_weight_band(bc)
@@ -510,6 +715,9 @@ def normalize_andreani_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,
                     "w_to": float(w2),
                     "cost": float(cost),
                     "exc_per_kg": None if pd.isna(exc) else float(exc),
+                    "sgd_fijo": None if pd.isna(sgd_fijo) else float(sgd_fijo),
+                    "sgd_umbral": None if pd.isna(sgd_umbral) else float(sgd_umbral),
+                    "sgd_pct_exceso": None if pd.isna(sgd_pct_exceso) else float(sgd_pct_exceso),
                 }
             )
 
@@ -525,44 +733,101 @@ def normalize_andreani_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,
     return out.reset_index(drop=True), meta
 
 
-def tariff_lookup(matrix_long: pd.DataFrame, *, region_key: str, kg: float) -> Tuple[Optional[float], Optional[float], str]:
+
+def tariff_lookup(
+    matrix_long: pd.DataFrame,
+    *,
+    region_key: str,
+    kg: float,
+    valor_declarado_ars: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float], Optional[float], str, str]:
     """
     Devuelve:
-      (expected_cost, exc_used, status)
-    - Si kg cae dentro de una banda: cost
-    - Si kg excede el máximo w_to: cost(max_band) + exc_per_kg*(kg - w_to_max) si existe exc
-    - Si no hay region: status SIN_REGION_EN_MATRIZ
+      (disd_esperado, sgd_esperado, exc_used, status, sgd_status)
+
+    DISD:
+      - Si kg cae dentro de una banda: cost
+      - Si kg excede el máximo w_to: cost(max_band) + exc_per_kg*(kg - w_to_max) si existe exc
+      - Si no hay region: status SIN_REGION_EN_MATRIZ
+
+    SGD (Seguro):
+      - Se toma de la matriz por región (si existe): sgd_fijo, sgd_umbral, sgd_pct_exceso
+      - Fórmula: sgd_fijo + sgd_pct_exceso * max(0, valor_declarado - sgd_umbral)
+      - Si no hay valor_declarado: usa solo sgd_fijo (marca sgd_status)
     """
     if not region_key:
-        return None, None, "SIN_REGION"
+        return None, None, None, "SIN_REGION", "SGD_NO_APLICA"
+
+    if "region_key" not in matrix_long.columns:
+        return None, None, None, "MATRIZ_SIN_REGION_KEY", "SGD_NO_APLICA"
 
     m = matrix_long[matrix_long["region_key"] == region_key].copy()
     if m.empty:
-        return None, None, "SIN_REGION_EN_MATRIZ"
+        return None, None, None, "SIN_REGION_EN_MATRIZ", "SGD_NO_APLICA"
 
+    # -----------------
+    # Seguro (SGD)
+    # -----------------
+    sgd_fijo = m["sgd_fijo"].iloc[0] if "sgd_fijo" in m.columns else None
+    sgd_umbral = m["sgd_umbral"].iloc[0] if "sgd_umbral" in m.columns else None
+    sgd_pct = m["sgd_pct_exceso"].iloc[0] if "sgd_pct_exceso" in m.columns else None
+
+    # Normalización numérica
+    def _to_float(x):
+        try:
+            if x is None or (isinstance(x, float) and math.isnan(x)):
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    sgd_fijo = _to_float(sgd_fijo)
+    sgd_umbral = _to_float(sgd_umbral) if sgd_umbral is not None else 0.0
+    sgd_pct = _to_float(sgd_pct) if sgd_pct is not None else 0.0
+
+    sgd_status = "SGD_OK"
+    if sgd_fijo is None:
+        sgd_esperado = None
+        sgd_status = "SGD_SIN_CONFIG"
+    else:
+        vd = _to_float(valor_declarado_ars)
+        if vd is None:
+            sgd_esperado = float(sgd_fijo)
+            # Si hay pct configurado pero no hay VD, avisamos (igual calculamos fijo)
+            if sgd_pct and sgd_pct != 0.0:
+                sgd_status = "SGD_SOLO_FIJO_SIN_VD"
+            else:
+                sgd_status = "SGD_FIJO"
+        else:
+            exceso = max(0.0, float(vd) - float(sgd_umbral or 0.0))
+            sgd_esperado = float(sgd_fijo) + float(sgd_pct or 0.0) * exceso
+            sgd_status = "SGD_OK"
+
+    # -----------------
+    # DISD (bandas)
+    # -----------------
     kg = float(kg)
-    # dentro de banda (inclusive)
-    inside = m[(m["w_from"] <= kg) & (kg <= m["w_to"])]
-    if not inside.empty:
-        # si hubiera duplicados, tomamos el mínimo costo (conservador)
-        row = inside.sort_values(["w_from", "w_to", "cost"], ascending=[True, True, True]).iloc[0]
-        return float(row["cost"]), None, "OK"
 
-    # si supera máximo: aplicar excedente
+    # dentro de banda
+    inside = m[(m["w_from"] <= kg) & (kg <= m["w_to"])].sort_values(["w_to", "w_from"], ascending=[True, True])
+    if not inside.empty:
+        row = inside.iloc[0]
+        return float(row["cost"]), sgd_esperado, None, "OK", sgd_status
+
+    # excede máximo
     max_row = m.sort_values(["w_to", "w_from"], ascending=[False, False]).iloc[0]
     w_to = float(max_row["w_to"])
     base_cost = float(max_row["cost"])
-    exc = max_row["exc_per_kg"]
+    exc = max_row.get("exc_per_kg", None)
     if kg > w_to:
         if exc is None or (isinstance(exc, float) and math.isnan(exc)):
-            return None, None, "SIN_BANDA_SIN_EXC"
+            return None, sgd_esperado, None, "SIN_BANDA_SIN_EXC", sgd_status
         extra = float(exc) * (kg - w_to)
-        return base_cost + extra, float(exc), "OK_EXCEDENTE"
+        return base_cost + extra, sgd_esperado, float(exc), "OK_EXCEDENTE", sgd_status
 
-    # si queda por debajo del mínimo: tomar la mínima banda
+    # por debajo del mínimo: tomar mínima banda
     min_row = m.sort_values(["w_from", "w_to"], ascending=[True, True]).iloc[0]
-    return float(min_row["cost"]), None, "OK_UNDER_MIN"
-
+    return float(min_row["cost"]), sgd_esperado, None, "OK_UNDER_MIN", sgd_status
 
 # =========================
 # Matrices Registry (simple)
@@ -713,7 +978,13 @@ def pick_active_matrix(marketplace: str, ref_date: dt.date) -> Optional[Dict[str
             continue
         if m.get("marketplace") != marketplace:
             continue
-        if m.get("kind") != "RAW":
+        k = str(m.get("kind","")).strip().upper()
+        if marketplace == "andreani":
+            if k not in {"RAW","ANDREANI"}:
+                continue
+        else:
+            if k != "RAW":
+                continue
             continue
 
         vf = _parse(m.get("valid_from"))
@@ -888,6 +1159,9 @@ if page == "CP Master":
     if "CP_int" not in cur.columns:
         cur["CP_int"] = cur["CP"].apply(parse_cp_to_int)
 
+    # Alias consistente para el resto del módulo
+    cp_master = cur
+
     # -------------------------
     # Barra de herramientas
     # -------------------------
@@ -956,6 +1230,71 @@ if page == "CP Master":
 
     edited = _recalc(edited)
 
+
+    # -------------------------
+    # Guardar edición inline (del editor)
+    # -------------------------
+    st.subheader("Guardar edición inline")
+    st.caption("Aplica SOLO los cambios de la tabla visible (filtrada), sin tocar el resto del dataset.")
+
+    confirm_inline = st.checkbox("Confirmo que quiero guardar los cambios del editor.", key="cp_inline_confirm")
+
+    if st.button("Aplicar cambios (guardar CP Master)", disabled=not confirm_inline, key="cp_inline_apply"):
+        base = cp_master.copy()
+        if "CP_int" not in base.columns:
+            base["CP_int"] = base["CP"].apply(parse_cp_to_int)
+        if "region_key" not in base.columns:
+            base["region_key"] = base.get("sub_region", pd.Series([None]*len(base))).apply(normalize_region_key)
+
+        # Recalcular claves en lo editado
+        upd = _recalc(edited_calc)
+
+        # Mantener solo filas con CP válido
+        upd = upd[upd["CP_int"].notna()].copy()
+        if upd.empty:
+            st.error("No hay filas válidas para guardar (CP inválidos).")
+        else:
+            # Asegurar columnas mínimas en base
+            for c in ["Provincia", "Localidad", "region_base", "sub_region", "region_key"]:
+                if c not in base.columns:
+                    base[c] = ""
+
+            added = 0
+            updated = 0
+
+            # Índice por CP_int para update rápido
+            base_idx = base.set_index("CP_int", drop=False)
+
+            for _, r in upd.iterrows():
+                cp_i = int(r["CP_int"])
+                payload = {
+                    "CP": cp_i,
+                    "CP_int": cp_i,
+                    "Provincia": str(r.get("Provincia", "")).strip(),
+                    "Localidad": str(r.get("Localidad", "")).strip(),
+                    "region_base": str(r.get("region_base", "")).strip(),
+                    "sub_region": str(r.get("sub_region", "")).strip(),
+                    "region_key": r.get("region_key"),
+                }
+
+                if cp_i in base_idx.index:
+                    mask = base["CP_int"] == cp_i
+                    for k, v in payload.items():
+                        if k in base.columns:
+                            base.loc[mask, k] = v
+                    updated += 1
+                else:
+                    base = pd.concat([base, pd.DataFrame([payload])], ignore_index=True)
+                    added += 1
+
+            base = base.sort_values("CP_int").reset_index(drop=True)
+
+            backup_file(CP_MASTER_PATH, "cp_master")
+            save_pickle(CP_MASTER_PATH, base)
+            audit_log("cp_master_apply_inline", {"rows": int(len(base)), "added": int(added), "updated": int(updated)})
+            st.success(f"Listo: CP Master guardado. (+{added} nuevos, {updated} actualizados)")
+            st.rerun()
+
     st.divider()
 
     # -------------------------
@@ -963,47 +1302,90 @@ if page == "CP Master":
     # -------------------------
     st.subheader("Agregar CP manual (rápido)")
 
-    a1, a2, a3, a4 = st.columns([1, 2, 2, 2])
-    with a1:
-        new_cp = st.text_input("CP", value="")
-    with a2:
-        new_prov = st.text_input("Provincia", value="")
-    with a3:
-        new_loc = st.text_input("Localidad", value="")
-    with a4:
-        new_sub = st.text_input("Sub región (ej: PAT I 64 / LOC 53)", value="")
+    # listas para dropdown
+    prov_list = provinces_ar()
+    sub_list = list_subregions_from_cp_master(cp_master)
+
+    c1, c2, c3, c4 = st.columns([1, 2, 3, 2])
+
+    with c1:
+        cp_in = st.text_input("CP", value="", placeholder="Ej: 3089")
+
+    with c2:
+        # Dropdown Provincia
+        prov_in = st.selectbox(
+            "Provincia",
+            options=[""] + prov_list,
+            index=0,
+        )
+
+    with c3:
+        loc_in = st.text_input("Localidad", value="", placeholder="Ej: San José Del Rincón")
+
+    with c4:
+        # Dropdown Sub región (tomada de CP Master)
+        sub_opts = [""] + sub_list
+        sub_in = st.selectbox(
+            "Sub región (ej: PAT I 64 / LOC 53)",
+            options=sub_opts,
+            index=0,
+        )
+
+    # (Opcional) permitir escribir sub_region nueva si no existe aún
+    allow_custom_sub = st.checkbox("Permitir escribir sub_región nueva (si no está en la lista)", value=False)
+    if allow_custom_sub:
+        sub_in_custom = st.text_input("Sub región (manual)", value=sub_in or "")
+        sub_in = sub_in_custom.strip()
 
     if st.button("Agregar / Actualizar este CP"):
-        cp_int = parse_cp_to_int(new_cp)
+        cp_int = parse_cp_to_int(cp_in)
+
         if cp_int is None:
-            st.error("CP inválido.")
+            st.error("CP inválido. Usá un número (ej: 3089 / 9033).")
+            st.stop()
+
+        if not prov_in:
+            st.error("Elegí una Provincia.")
+            st.stop()
+
+        if not loc_in.strip():
+            st.error("Completá Localidad.")
+            st.stop()
+
+        if not sub_in or not str(sub_in).strip():
+            st.error("Elegí una Sub región.")
+            st.stop()
+
+        # Normalización mínima (respetamos tu formato: 'IN I14' / 'PAT I 64' / 'LOC 53' tal cual)
+        row = {
+            "CP": int(cp_int),
+            "CP_int": int(cp_int),
+            "Provincia": str(prov_in).strip(),
+            "Localidad": str(loc_in).strip(),
+            "region_base": "",
+            "sub_region": str(sub_in).strip(),
+            "region_key": normalize_region_key(str(sub_in).strip()) if str(sub_in).strip() else None,
+        }
+
+        # upsert en cp_master
+        base = cp_master.copy()
+        if (base["CP_int"] == int(cp_int)).any():
+            base.loc[base["CP_int"] == int(cp_int), ["Provincia", "Localidad", "sub_region"]] = [
+                row["Provincia"],
+                row["Localidad"],
+                row["sub_region"],
+            ]
+            st.success(f"CP {cp_int} actualizado.")
         else:
-            rk = normalize_region_key(new_sub) if new_sub.strip() else None
-            row = {
-                "CP": str(new_cp).strip(),
-                "Provincia": str(new_prov).strip(),
-                "Localidad": str(new_loc).strip(),
-                "region_base": None,
-                "sub_region": str(new_sub).strip() if new_sub.strip() else None,
-                "region": None,
-                "CP_int": cp_int,
-                "region_key": rk,
-            }
+            base = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
+            st.success(f"CP {cp_int} agregado.")
 
-            base = cur.copy()
-            base["CP_int"] = base["CP"].apply(parse_cp_to_int)
+        # guardar
+        backup_file(CP_MASTER_PATH, "cp_master")
+        save_pickle(CP_MASTER_PATH, base)
+        audit_log("cp_master_upsert_manual", {"cp": int(cp_int), "provincia": row["Provincia"], "sub_region": row["sub_region"]})
+        st.rerun()
 
-            if (base["CP_int"] == cp_int).any():
-                base.loc[base["CP_int"] == cp_int, list(row.keys())] = pd.Series(row)
-                st.success(f"Actualizado CP {cp_int}.")
-            else:
-                base = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
-                st.success(f"Agregado CP {cp_int}.")
-
-            # refrescar en memoria del módulo (no guarda todavía)
-            cur = base
-
-    st.divider()
 
     # -------------------------
     # Import incremental (UPSERT por CP)
@@ -1100,6 +1482,72 @@ if page == "Catálogo":
         st.caption(f"Dataset actual: {len(cur):,} filas")
         safe_show_df(cur, label="catalog_actual")
 
+    # -------------------------
+    # Carga manual (1 SKU)
+    # -------------------------
+    with st.expander("Agregar SKU manual (rápido)", expanded=False):
+        st.caption("Agrega o actualiza un SKU del catálogo (sirve para destrabar auditorías sin reimportar todo).")
+        c1, c2, c3 = st.columns([2, 4, 2])
+        with c1:
+            manual_sku = st.text_input("SKU", value="", placeholder="Ej: 171-0122", key="cat_manual_sku")
+        with c2:
+            manual_prod = st.text_input("Producto", value="", placeholder="Nombre producto", key="cat_manual_prod")
+        with c3:
+            manual_peso = st.number_input("Peso aforado (kg)", min_value=0.0, value=0.0, step=0.1, key="cat_manual_peso")
+
+        mode = st.radio("Acción", ["Agregar", "Reemplazar (mismo SKU)"], horizontal=True, index=1, key="cat_manual_mode")
+
+        if st.button("Guardar SKU manual", key="cat_manual_save"):
+            sku_clean = str(manual_sku or "").strip()
+            prod_clean = str(manual_prod or "").strip()
+
+            if not sku_clean:
+                st.error("Falta SKU.")
+                st.stop()
+            if not prod_clean:
+                st.error("Falta Producto.")
+                st.stop()
+            if manual_peso is None or float(manual_peso) <= 0:
+                st.error("Peso aforado debe ser > 0.")
+                st.stop()
+
+            one = pd.DataFrame([{
+                "sku": sku_clean,
+                "producto": prod_clean,
+                "peso_aforado_kg": float(manual_peso),
+            }])
+
+            try:
+                n1, w1 = normalize_catalog(one)
+            except Exception as e:
+                st.error(f"No pude guardar el SKU manual. Motivo: {e}")
+                st.stop()
+
+            row = n1.iloc[0].to_dict()
+            cat_cur = cur.copy() if cur is not None else pd.DataFrame(columns=n1.columns)
+
+            if len(cat_cur) and "sku" in cat_cur.columns:
+                mask = cat_cur["sku"].astype(str).str.strip() == row["sku"]
+            else:
+                mask = pd.Series([False]*len(cat_cur))
+
+            exists = bool(mask.any()) if len(cat_cur) else False
+
+            if exists and mode.startswith("Reemplazar"):
+                first_idx = cat_cur.index[mask][0]
+                for col in n1.columns:
+                    cat_cur.at[first_idx, col] = row.get(col)
+                action_done = "actualizado"
+            else:
+                cat_cur = pd.concat([cat_cur, n1], ignore_index=True)
+                action_done = "agregado"
+
+            backup_file(CATALOG_PATH, "catalog")
+            save_pickle(CATALOG_PATH, cat_cur.reset_index(drop=True))
+            audit_log("catalog_manual_upsert", {"sku": row["sku"], "action": action_done})
+            st.success(f"SKU {action_done} OK ✅")
+            st.rerun()
+
     up = st.file_uploader("Subí Catálogo (xlsx/csv)", type=["xlsx", "xls", "csv"])
     if up:
         if up.name.lower().endswith(".csv"):
@@ -1127,32 +1575,307 @@ if page == "Catálogo":
 # =========================
 if page == "Ventas":
     st.subheader("Ventas — Import / Simular / Aplicar")
+
     cur = get_sales()
     if cur is not None:
         st.caption(f"Dataset actual: {len(cur):,} filas")
         safe_show_df(cur, label="ventas_actual")
 
+    # -------------------------
+    # Carga manual (1 venta)
+    # -------------------------
+    with st.expander("Agregar venta manual (rápido)", expanded=False):
+        st.caption("Agrega o actualiza una línea de venta (guía + SKU). Útil para corregir rápido sin reimportar todo.")
+        c1, c2, c3, c4 = st.columns([2, 1, 2, 1])
+        with c1:
+            manual_guia = st.text_input("Guía", value="", placeholder="Ej: 400400003136148")
+        with c2:
+            manual_cp = st.text_input("CP", value="", placeholder="Ej: 9033")
+        with c3:
+            manual_sku = st.text_input("SKU", value="", placeholder="Ej: 171-0122")
+        with c4:
+            manual_qty = st.number_input("Qty", min_value=1, value=1, step=1)
+
+        c5, c6 = st.columns([1, 1])
+        with c5:
+            manual_fecha_envio = st.date_input("Fecha envío (opcional)", value=None)
+        with c6:
+            manual_valor_decl = st.number_input("Valor declarado ARS (opcional)", min_value=0.0, value=0.0, step=1000.0)
+
+        mode = st.radio("Acción", ["Agregar", "Reemplazar (misma guía+SKU)"], horizontal=True, index=1)
+
+        if st.button("Guardar venta manual"):
+            guia_clean = normalize_guia(manual_guia)
+            sku_clean = str(manual_sku or "").strip()
+            cp_raw = str(manual_cp or "").strip()
+
+            if not guia_clean:
+                st.error("Falta Guía.")
+                st.stop()
+            if not sku_clean:
+                st.error("Falta SKU.")
+                st.stop()
+
+            # Armamos DF de 1 fila y reutilizamos normalizador (mismas reglas que import)
+            one = pd.DataFrame([{
+                "guia": guia_clean,
+                "cp": cp_raw,
+                "sku": sku_clean,
+                "qty": int(manual_qty),
+                "fecha_envio": manual_fecha_envio,
+                "valor_declarado_ars": float(manual_valor_decl) if manual_valor_decl else None,
+            }])
+
+            try:
+                n1, w1, d1 = normalize_sales(one)
+            except Exception as e:
+                st.error(f"No pude guardar la venta manual. Motivo: {e}")
+                st.stop()
+
+            if d1 is not None and not d1.empty:
+                st.error("No se guardó: la fila quedó descartada (sin guía o sin SKU).")
+                safe_show_df(d1, label="venta_manual_descartada")
+                st.stop()
+
+            row = n1.iloc[0].to_dict()
+
+            sales_cur = cur.copy() if cur is not None else pd.DataFrame(columns=n1.columns)
+
+            mask = (sales_cur.get("guia", pd.Series(dtype="string")) == row["guia"]) & (sales_cur.get("sku", pd.Series(dtype="string")) == row["sku"])
+            exists = bool(mask.any()) if len(sales_cur) else False
+
+            if exists and mode.startswith("Reemplazar"):
+                # reemplaza la primera coincidencia (dejamos 1 línea por guía+SKU)
+                first_idx = sales_cur.index[mask][0]
+                for col in n1.columns:
+                    sales_cur.at[first_idx, col] = row.get(col)
+                # si hubiese más duplicados, los dejamos tal cual (puede ser a propósito); opcional: eliminarlos
+                action_done = "actualizada"
+            else:
+                sales_cur = pd.concat([sales_cur, n1], ignore_index=True)
+                action_done = "agregada"
+
+            backup_file(SALES_PATH, "sales")
+            save_pickle(SALES_PATH, sales_cur.reset_index(drop=True))
+            audit_log("sales_manual_upsert", {"guia": row["guia"], "sku": row["sku"], "action": action_done})
+            st.success(f"Venta {action_done} OK ✅")
+            st.rerun()
+
     up = st.file_uploader("Subí Ventas (xlsx/csv)", type=["xlsx", "xls", "csv"])
     if up:
+        # -------------------------
+        # Lectura robusta (Excel con múltiples hojas)
+        # -------------------------
         if up.name.lower().endswith(".csv"):
-            raw = pd.read_csv(up)
+            raw = pd.read_csv(
+                up,
+                dtype={"guia": "string"},
+                encoding_errors="ignore",
+            )
+            detected_sheet = "CSV"
         else:
-            raw = pd.read_excel(up, engine="openpyxl")
+            xls = pd.read_excel(up, sheet_name=None, engine="openpyxl")
 
-        norm, warns = normalize_sales(raw)
+            if "VENTAS" in xls:
+                raw = xls["VENTAS"]
+                detected_sheet = "VENTAS"
+            else:
+                required = {"guia", "cp", "sku", "qty"}
+                raw = None
+                detected_sheet = None
+
+                for sh, df in xls.items():
+                    cols = {str(c).strip().lower() for c in df.columns}
+                    if required.issubset(cols):
+                        raw = df
+                        detected_sheet = sh
+                        break
+
+                if raw is None:
+                    detected_sheet = next(iter(xls.keys()))
+                    raw = xls[detected_sheet]
+
+        st.caption(f"Hoja detectada: {detected_sheet}")
+
+        # -------------------------
+        # Normalización
+        # -------------------------
+        try:
+            norm, warns, dropped = normalize_sales(raw)
+        except Exception as e:
+            st.error(f"No pude normalizar Ventas. Motivo: {e}")
+            st.info("Tip: la hoja debe contener columnas: guia, cp, sku, qty (+ opcional fecha_envio, valor_declarado_ars).")
+            st.stop()
+
         st.success(f"OK: Ventas normalizadas ({len(norm):,} filas)")
         for w in warns:
             st.warning(w)
 
+        # -------------------------
+        # Preview + descarga
+        # -------------------------
         safe_show_df(norm, label="ventas_preview")
-        st.download_button("Descargar preview (Excel)", data=to_excel_bytes(norm, "ventas"), file_name="ventas_normalizadas.xlsx")
+        st.download_button(
+            "Descargar preview (Excel)",
+            data=to_excel_bytes(norm, "ventas"),
+            file_name="ventas_normalizadas.xlsx",
+        )
 
+        # -----------------------------------
+        # Descargar TODO lo que tenga pendientes (para corregir y reimportar)
+        # -----------------------------------
+        def _build_sales_errors(df: pd.DataFrame) -> pd.DataFrame:
+            out = df.copy()
+            out["error_reason"] = ""
+
+            if "flag_cp_invalido" in out.columns:
+                out.loc[out["flag_cp_invalido"], "error_reason"] += "CP_INVALIDO; "
+
+            if "fecha_envio" in out.columns:
+                out.loc[out["fecha_envio"].isna(), "error_reason"] += "FECHA_ENVIO_INVALIDA; "
+
+            if "valor_declarado_ars" in out.columns:
+                out.loc[out["valor_declarado_ars"].isna(), "error_reason"] += "SIN_VALOR_DECLARADO; "
+
+            out = out[out["error_reason"].str.len() > 0].copy()
+            out["error_reason"] = out["error_reason"].str.strip()
+
+            prefer = [
+                "error_reason",
+                "guia",
+                "cp",
+                "cp_int",
+                "sku",
+                "qty",
+                "fecha_envio",
+                "valor_declarado_ars",
+                "flag_cp_invalido",
+            ]
+            cols = [c for c in prefer if c in out.columns] + [c for c in out.columns if c not in prefer]
+            return out[cols]
+
+        errors_df = _build_sales_errors(norm)
+
+        if not errors_df.empty:
+            st.warning(f"Pendientes detectados: {len(errors_df):,} filas. Descargalos, corregí y reimportá.")
+            safe_show_df(errors_df, label="ventas_errores")
+
+            st.download_button(
+                "Descargar PENDIENTES (Excel)",
+                data=to_excel_bytes(errors_df, "pendientes_ventas"),
+                file_name="ventas_pendientes.xlsx",
+            )
+            st.download_button(
+                "Descargar PENDIENTES (CSV)",
+                data=errors_df.to_csv(index=False).encode("utf-8"),
+                file_name="ventas_pendientes.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("No se detectaron pendientes en Ventas ✅")
+
+        # -----------------------------------
+        # Filas eliminadas (sin guia / sin sku) — EDITABLES y reintegrables
+        # -----------------------------------
+        if dropped is not None and not dropped.empty:
+            st.error(
+                f"Filas eliminadas: {len(dropped):,} (no se importan porque faltan datos clave). "
+                "Podés editarlas acá y reintentar incluirlas."
+            )
+
+            # Mostramos solo lo útil para corregir (y evitamos ruido)
+            editable_cols = ["guia", "cp", "sku", "qty", "fecha_envio", "valor_declarado_ars"]
+            view_cols = [c for c in editable_cols if c in dropped.columns]
+            dropped_view = dropped.copy()
+
+            # Si alguna no existe, la creamos para que el editor no rompa
+            for c in editable_cols:
+                if c not in dropped_view.columns:
+                    dropped_view[c] = None
+
+            st.caption("Editá los campos faltantes (ej: sku/guia/cp). Luego podés reintentar incluirlas.")
+            dropped_edit = st.data_editor(
+                dropped_view[editable_cols],
+                use_container_width=True,
+                num_rows="dynamic",
+                hide_index=True,
+                key="ventas_dropped_editor",
+            )
+
+            c1, c2, c3 = st.columns([1, 1, 2])
+
+            with c1:
+                st.download_button(
+                    "Descargar FILAS ELIMINADAS (Excel)",
+                    data=to_excel_bytes(dropped, "filas_eliminadas"),
+                    file_name="ventas_filas_eliminadas.xlsx",
+                )
+
+            with c2:
+                discard = st.button("Descartar eliminadas y seguir", type="secondary")
+
+            with c3:
+                retry = st.button("Reintentar incluir editadas", type="primary")
+
+            if discard:
+                st.info("OK. Se descartan las eliminadas. Podés aplicar cambios con el dataset normalizado.")
+                # No hacemos nada: norm queda tal cual
+                # (Si querés, acá podríamos setear dropped vacío)
+                # st.rerun()
+
+            if retry:
+                # Armamos un RAW reparado: norm (en formato canónico) + dropped_edit (editado)
+                # Importante: usamos nombres esperados por normalize_sales: guia, cp, sku, qty, fecha_envio, valor_declarado_ars
+                reparadas_raw = dropped_edit.copy()
+
+                # concatenamos con norm "base", pero norm ya está normalizado (tiene cp_int/flag)
+                # Necesitamos reconstruir un raw simple desde norm
+                base_raw = norm.copy()
+                base_raw = base_raw.rename(columns={"cp_int": "cp_int"})  # no-op, por claridad
+                # mantener columnas que normalize_sales entiende
+                base_raw = base_raw[["guia", "cp", "sku", "qty", "fecha_envio", "valor_declarado_ars"]].copy()
+
+                raw_merged = pd.concat([base_raw, reparadas_raw], ignore_index=True)
+
+                # Re-normalizamos TODO junto
+                try:
+                    norm2, warns2, dropped2 = normalize_sales(raw_merged)
+                except Exception as e:
+                    st.error(f"No pude reintentar incluir. Motivo: {e}")
+                    st.stop()
+
+                st.success(f"Reintento OK. Ahora importables: {len(norm2):,} filas. Eliminadas restantes: {len(dropped2):,}.")
+                for w in warns2:
+                    st.warning(w)
+
+                # Reemplazamos en memoria lo que se muestra a partir de ahora
+                norm = norm2
+                dropped = dropped2
+
+                # Mostrar preview actualizado
+                safe_show_df(norm, label="ventas_preview_reintento")
+                st.download_button(
+                    "Descargar preview actualizado (Excel)",
+                    data=to_excel_bytes(norm, "ventas_reintento"),
+                    file_name="ventas_normalizadas_actualizadas.xlsx",
+                )
+
+                # Si quedaron eliminadas, mostrarlas (y se pueden volver a editar)
+                if dropped is not None and not dropped.empty:
+                    st.error(f"Quedan {len(dropped):,} filas aún eliminadas (faltan datos clave). Podés seguir editando y reintentar.")
+                    safe_show_df(dropped, label="ventas_dropped_restantes")
+
+
+        # -------------------------
+        # Aplicar
+        # -------------------------
         confirm = st.checkbox("Confirmo que quiero aplicar cambios (guardar en disco).")
         if st.button("Aplicar cambios", disabled=not confirm):
             backup_file(SALES_PATH, "sales")
             save_pickle(SALES_PATH, norm)
-            audit_log("sales_apply", {"rows": len(norm), "file": up.name})
+            audit_log("sales_apply", {"rows": int(len(norm)), "file": up.name})
             st.success("Listo: Ventas guardadas.")
+            st.rerun()
 
 # =========================
 # Matriz Andreani
@@ -1161,14 +1884,18 @@ if page == "Matriz Andreani":
     st.subheader("Matriz Andreani — Import / Publicar / Usar en auditoría")
 
     reg = load_registry()
-    mats = [m for m in reg.get("matrices", []) if m.get("kind") == "andreani"]
+    mats = [m for m in reg.get("matrices", [])
+            if (str(m.get("marketplace","")).lower() == "andreani" or str(m.get("kind","")).lower() == "andreani")
+            ]
     if mats:
         st.write("Matrices registradas (Andreani)")
         safe_show_df(pd.DataFrame(mats), label="registry_andreani")
 
     up = st.file_uploader("Subí Matriz Andreani (xlsx)", type=["xlsx", "xls"])
     if up:
-        raw = pd.read_excel(up, engine="openpyxl")
+        raw, sheet = read_excel_best_sheet(up, prefer_sheets=["MATRIZ_RAW","MATRIZ RAW","MATRIZ"])
+        if sheet:
+            st.caption(f"Hoja detectada: {sheet}")
         norm, meta = normalize_andreani_matrix(raw)
 
         st.success(f"OK: matriz normalizada ({len(norm):,} filas / {len(meta.get('regions', []))} regiones)")
@@ -1229,6 +1956,34 @@ if page == "Auditor Facturas":
 
     # Fallback manual (si falta fecha_envio / fecha_factura)
     ref_date = st.date_input("Fecha de referencia (fallback si falta fecha_envío)", value=today())
+    st.caption("Tolerancias: evita falsos positivos por redondeos/ajustes. Elegí % **o** $ (uno solo).")
+
+    t1, t2, t3, t4 = st.columns([1, 1, 1, 1])
+
+    # DISD
+    with t1:
+        disd_mode = st.radio("DISD tolerancia", ["$", "%"], horizontal=True, index=0, key="disd_mode")
+    with t2:
+        if disd_mode == "$":
+            disd_abs_tol = st.number_input("DISD ±$ (tolerancia)", min_value=0.0, value=50.0, step=10.0, key="disd_abs")
+            disd_pct_tol = 0.0
+        else:
+            disd_pct = st.number_input("DISD ±% (tolerancia)", min_value=0.0, value=0.5, step=0.1, key="disd_pct")
+            disd_pct_tol = float(disd_pct) / 100.0
+            disd_abs_tol = 0.0
+
+    # SGD / Seguro declarado
+    with t3:
+        sgd_mode = st.radio("SGD tolerancia", ["$", "%"], horizontal=True, index=0, key="sgd_mode")
+    with t4:
+        if sgd_mode == "$":
+            sgd_abs_tol = st.number_input("SGD ±$ (tolerancia)", min_value=0.0, value=50.0, step=10.0, key="sgd_abs")
+            sgd_pct_tol = 0.0
+        else:
+            sgd_pct = st.number_input("SGD ±% (tolerancia)", min_value=0.0, value=0.5, step=0.1, key="sgd_pct")
+            sgd_pct_tol = float(sgd_pct) / 100.0
+            sgd_abs_tol = 0.0
+
 
     pdfs = st.file_uploader("Subí factura(s) PDF", type=["pdf"], accept_multiple_files=True)
     if not pdfs:
@@ -1322,6 +2077,7 @@ if page == "Auditor Facturas":
         by_guia = s.groupby("guia", as_index=False).agg(
             cp_int=("cp_int", "first"),
             fecha_envio=("fecha_envio", "first"),
+            valor_declarado_ars=("valor_declarado_ars", "first"),
             kg_esperado=("line_weight", "sum"),
         )
         step2 = ship.merge(by_guia, on="guia", how="left", indicator=True)
@@ -1336,7 +2092,11 @@ if page == "Auditor Facturas":
         step3 = step2.copy()
         step3["provincia"] = mapped.apply(lambda x: x[0])
         step3["localidad"] = mapped.apply(lambda x: x[1])
-        step3["region_key"] = mapped.apply(lambda x: x[2])
+
+        # Si _map_cp devuelve: (provincia, localidad, sub_region, region_key)
+        step3["sub_region"] = mapped.apply(lambda x: x[2])
+        step3["region_key"] = mapped.apply(lambda x: x[3])
+
         step3["flag_cp_no_encontrado"] = step3["cp_int"].notna() & step3["provincia"].isna()
         step3["flag_sin_region"] = step3["region_key"].isna()
         step3_all.append(step3.copy())
@@ -1374,37 +2134,50 @@ if page == "Auditor Facturas":
         # -----------------
         # Paso 5: tarifa esperada con (region_key + kg_factura) en matriz RAW seleccionada
         # -----------------
-        def _expected_from_matrix(row) -> Tuple[Optional[float], str]:
+        def _expected_from_matrix(row) -> Tuple[Optional[float], Optional[float], str, str]:
             if row.get("flag_sin_matriz"):
-                return None, "SIN MATRIZ (no hay PUBLISHED vigente)"
+                return None, None, "SIN MATRIZ (no hay PUBLISHED vigente)", "SGD_NO_APLICA"
             rk = row.get("region_key")
             if not rk:
-                return None, "SIN REGIÓN (CP no mapea)"
+                return None, None, "SIN REGIÓN (CP no mapea)", "SGD_NO_APLICA"
 
             kg_fact = row.get("kg_factura")
             if kg_fact is None or (isinstance(kg_fact, float) and math.isnan(kg_fact)) or kg_fact <= 0:
-                return None, "SIN PESO FACTURA"
+                return None, None, "SIN PESO FACTURA", "SGD_NO_APLICA"
 
             mrec, mdf = _get_matrix_for_date(row["fecha_base"])
             if mdf is None:
-                return None, "SIN MATRIZ (archivo no cargó)"
+                return None, None, "SIN MATRIZ (archivo no cargó)", "SGD_NO_APLICA"
 
-            val, exc, status = tariff_lookup(mdf, region_key=str(rk), kg=float(kg_fact))
-            if val is None:
+            disd_val, sgd_val, exc, status, sgd_status = tariff_lookup(
+                mdf,
+                region_key=str(rk),
+                kg=float(kg_fact),
+                valor_declarado_ars=row.get("valor_declarado_ars"),
+            )
+
+            # DISD (principal)
+            if disd_val is None or (isinstance(disd_val, float) and math.isnan(disd_val)):
+                if status == "MATRIZ_SIN_REGION_KEY":
+                    return None, sgd_val, "SIN TARIFA (matriz sin region_key)", sgd_status
                 if status == "SIN_REGION_EN_MATRIZ":
-                    return None, "SIN TARIFA (región no existe en matriz)"
+                    return None, sgd_val, "SIN TARIFA (región no existe en matriz)", sgd_status
                 if status == "SIN_BANDA_SIN_EXC":
-                    return None, "SIN TARIFA (kg excede y no hay Exc)"
-                return None, "SIN TARIFA (no matchea banda)"
-            # si usó excedente, lo declaramos
+                    return None, sgd_val, "SIN TARIFA (kg excede y no hay Exc)", sgd_status
+                return None, sgd_val, "SIN TARIFA (no matchea banda)", sgd_status
+
             if status == "OK_EXCEDENTE":
-                return float(val), "OK (EXCEDENTE)"
-            return float(val), "OK"
+                return float(disd_val), sgd_val, "OK (EXCEDENTE)", sgd_status
+
+            # OK / OK_UNDER_MIN / etc
+            return float(disd_val), sgd_val, "OK", sgd_status
 
         exp = step4.apply(_expected_from_matrix, axis=1)
         step5 = step4.copy()
         step5["disd_esperado"] = exp.apply(lambda x: x[0])
-        step5["tarifa_status"] = exp.apply(lambda x: x[1])
+        step5["sgd_esperado"] = exp.apply(lambda x: x[1])
+        step5["tarifa_status"] = exp.apply(lambda x: x[2])
+        step5["sgd_status"] = exp.apply(lambda x: x[3])
         step5_all.append(step5.copy())
 
         # -----------------
@@ -1414,8 +2187,14 @@ if page == "Auditor Facturas":
 
         out["delta_kg"] = out["kg_factura"] - out["kg_esperado"]
         out["delta_disd"] = out["disd_factura"] - out["disd_esperado"]
+        out["delta_sgd"] = out["sgd_factura"] - out["sgd_esperado"]
+        # Tolerancias: bandas permitidas + flags OK
+        out["disd_band"] = out["disd_esperado"].apply(lambda e: tol_band(e, abs_tol=disd_abs_tol, pct_tol=disd_pct_tol))
+        out["sgd_band"] = out["sgd_esperado"].apply(lambda e: tol_band(e, abs_tol=sgd_abs_tol, pct_tol=sgd_pct_tol))
+        out["disd_ok"] = out.apply(lambda r: within_tol(r.get("disd_factura"), r.get("disd_esperado"), abs_tol=disd_abs_tol, pct_tol=disd_pct_tol), axis=1)
+        out["sgd_ok"] = out.apply(lambda r: within_tol(r.get("sgd_factura"), r.get("sgd_esperado"), abs_tol=sgd_abs_tol, pct_tol=sgd_pct_tol), axis=1)
 
-        # Estado final: prioriza fallas de data / matching
+        # Estado final: prioriza fallas de data / matching + aplica tolerancia
         def _final_state(r) -> str:
             if r.get("flag_sin_venta"):
                 return "SIN VENTA"
@@ -1425,9 +2204,21 @@ if page == "Auditor Facturas":
                 return "SIN REGIÓN"
             if r.get("flag_sin_matriz"):
                 return "SIN MATRIZ"
-            if not r.get("disd_esperado") or (isinstance(r.get("disd_esperado"), float) and math.isnan(r.get("disd_esperado"))):
+
+            disd_exp = r.get("disd_esperado")
+            if disd_exp is None or (isinstance(disd_exp, float) and math.isnan(disd_exp)):
                 return r.get("tarifa_status") or "SIN TARIFA"
-            return "OK"
+
+            disd_ok = within_tol(r.get("disd_factura"), disd_exp, abs_tol=disd_abs_tol, pct_tol=disd_pct_tol)
+            sgd_ok = within_tol(r.get("sgd_factura"), r.get("sgd_esperado"), abs_tol=sgd_abs_tol, pct_tol=sgd_pct_tol)
+
+            if disd_ok and sgd_ok:
+                return "OK (tolerancia)"
+            if (not disd_ok) and sgd_ok:
+                return "DIF TARIFA"
+            if disd_ok and (not sgd_ok):
+                return "DIF SEGURO"
+            return "DIF TARIFA+SEGURO"
 
         out["estado_final"] = out.apply(_final_state, axis=1)
 
@@ -1439,6 +2230,7 @@ if page == "Auditor Facturas":
             "source_pdf",
             "fecha_factura",
             "fecha_envio",
+            "valor_declarado_ars",
             "fecha_base",
             "fecha_base_source",
             "matrix_name_usada",
@@ -1454,6 +2246,13 @@ if page == "Auditor Facturas":
             "disd_esperado",
             "delta_disd",
             "sgd_factura",
+            "sgd_esperado",
+            "delta_sgd",
+            "disd_ok",
+            "disd_band",
+            "sgd_ok",
+            "sgd_band",
+            "sgd_status",
             "flag_sin_venta",
             "flag_cp_no_encontrado",
             "flag_sin_region",
@@ -1496,7 +2295,7 @@ if page == "Auditor Facturas":
 
     with st.expander("Paso 5 — Tarifa esperada (region_key + kg_factura → matriz RAW)", expanded=False):
         df5 = pd.concat(step5_all, ignore_index=True) if step5_all else pd.DataFrame()
-        safe_show_df(df5[["guia","region_key","kg_factura","matrix_name_usada","disd_esperado","tarifa_status"]], label="paso5_tarifa")
+        safe_show_df(df5[["guia","region_key","kg_factura","valor_declarado_ars","matrix_name_usada","disd_esperado","tarifa_status","sgd_esperado","sgd_status"]], label="paso5_tarifa")
 
     # ==================
     # Resultado final
